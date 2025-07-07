@@ -1,0 +1,23 @@
+{
+    "suspicious_paths": [
+        "\\temp\\",
+        "\\downloads\\",
+        "\\appdata\\local\\temp\\",
+        "\\programdata\\",
+        "\\windows\\temp\\"
+    ],
+    "suspicious_connections": [
+        "0.0.0.0",
+        "127.0.0.1"
+    ],
+    "high_risk_processes": [
+        "cmd.exe",
+        "powershell.exe",
+        "wscript.exe",
+        "cscript.exe",
+        "regsvr32.exe",
+        "mshta.exe",
+        "rundll32.exe",
+        "svchost.exe"
+    ]
+}
