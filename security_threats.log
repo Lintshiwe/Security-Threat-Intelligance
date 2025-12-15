@@ -9473,3 +9473,13 @@ Risk Score: 183
 2025-12-15 11:27:07 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
 2025-12-15 11:27:07 - SecurityMonitor - INFO - ThreatMonitor initialized
 2025-12-15 11:27:07 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 11:39:26 - SecurityMonitor - INFO - Application starting
+2025-12-15 11:39:30 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 11:39:30 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 11:39:30 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 11:41:37 - SecurityMonitor - ERROR - Error getting WiFi passwords: 'NoneType' object has no attribute 'split'
+2025-12-15 11:50:24 - SecurityMonitor - INFO - Application starting
+2025-12-15 11:50:27 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 11:50:27 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 11:50:27 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 11:51:09 - SecurityMonitor - ERROR - Enhanced network scan failed: name 'get_mac_vendor' is not defined

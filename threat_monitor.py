@@ -363,6 +363,625 @@ def get_router_default_credentials(vendor: str) -> str:
 • Check router label for default credentials"""
 
 
+def get_saved_wifi_passwords() -> List[Dict[str, str]]:
+    """Get all saved WiFi passwords from Windows."""
+    wifi_list = []
+    try:
+        # Get all saved WiFi profiles
+        result = subprocess.run(
+            ['netsh', 'wlan', 'show', 'profiles'],
+            capture_output=True, text=True, timeout=10,
+            encoding='utf-8', errors='ignore'
+        )
+        
+        if result.returncode != 0:
+            return []
+        
+        # Extract profile names
+        profiles = []
+        for line in result.stdout.split('\n'):
+            if 'All User Profile' in line or 'Current User Profile' in line:
+                # Handle both English and other languages
+                if ':' in line:
+                    profile_name = line.split(':')[1].strip()
+                    if profile_name:
+                        profiles.append(profile_name)
+        
+        # Get password for each profile
+        for profile in profiles:
+            try:
+                pwd_result = subprocess.run(
+                    ['netsh', 'wlan', 'show', 'profile', f'name={profile}', 'key=clear'],
+                    capture_output=True, text=True, timeout=10,
+                    encoding='utf-8', errors='ignore'
+                )
+                
+                password = None
+                security = "Unknown"
+                auth = "Unknown"
+                
+                for line in pwd_result.stdout.split('\n'):
+                    line_lower = line.lower()
+                    if 'key content' in line_lower or 'contenu de la clé' in line_lower:
+                        if ':' in line:
+                            password = line.split(':', 1)[1].strip()
+                    elif 'authentication' in line_lower:
+                        if ':' in line:
+                            auth = line.split(':', 1)[1].strip()
+                    elif 'cipher' in line_lower or 'chiffrement' in line_lower:
+                        if ':' in line:
+                            security = line.split(':', 1)[1].strip()
+                
+                wifi_list.append({
+                    'ssid': profile,
+                    'password': password if password else '(Open Network or Not Stored)',
+                    'security': security,
+                    'authentication': auth
+                })
+                
+            except Exception as e:
+                app_logger.debug(f"Could not get password for {profile}: {e}")
+                wifi_list.append({
+                    'ssid': profile,
+                    'password': '(Access Denied)',
+                    'security': 'Unknown',
+                    'authentication': 'Unknown'
+                })
+    
+    except Exception as e:
+        app_logger.error(f"Error getting WiFi passwords: {e}")
+    
+    return wifi_list
+
+
+def extract_confidential_data(payload: str) -> Dict[str, List[str]]:
+    """Extract potentially confidential information from packet payload."""
+    import re
+    
+    confidential = {
+        'passwords': [],
+        'usernames': [],
+        'emails': [],
+        'credit_cards': [],
+        'api_keys': [],
+        'tokens': [],
+        'urls': [],
+        'ips': [],
+        'cookies': [],
+        'auth_headers': [],
+        'sensitive_keywords': []
+    }
+    
+    if not payload:
+        return confidential
+    
+    # Password patterns
+    pwd_patterns = [
+        r'password[=:"\s]+([^\s&"<>]{3,50})',
+        r'passwd[=:"\s]+([^\s&"<>]{3,50})',
+        r'pwd[=:"\s]+([^\s&"<>]{3,50})',
+        r'pass[=:"\s]+([^\s&"<>]{3,50})',
+        r'secret[=:"\s]+([^\s&"<>]{3,50})',
+    ]
+    for pattern in pwd_patterns:
+        matches = re.findall(pattern, payload, re.IGNORECASE)
+        confidential['passwords'].extend(matches)
+    
+    # Username patterns
+    user_patterns = [
+        r'username[=:"\s]+([^\s&"<>]{3,50})',
+        r'user[=:"\s]+([^\s&"<>]{3,50})',
+        r'login[=:"\s]+([^\s&"<>]{3,50})',
+        r'userid[=:"\s]+([^\s&"<>]{3,50})',
+        r'email[=:"\s]+([^\s&"<>@]{3,50}@[^\s&"<>]{3,50})',
+    ]
+    for pattern in user_patterns:
+        matches = re.findall(pattern, payload, re.IGNORECASE)
+        confidential['usernames'].extend(matches)
+    
+    # Email addresses
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    confidential['emails'] = re.findall(email_pattern, payload)
+    
+    # Credit card patterns (basic detection)
+    cc_patterns = [
+        r'\b(?:4[0-9]{12}(?:[0-9]{3})?)\b',  # Visa
+        r'\b(?:5[1-5][0-9]{14})\b',  # MasterCard
+        r'\b(?:3[47][0-9]{13})\b',  # Amex
+        r'\b(?:6(?:011|5[0-9]{2})[0-9]{12})\b',  # Discover
+    ]
+    for pattern in cc_patterns:
+        matches = re.findall(pattern, payload)
+        confidential['credit_cards'].extend(matches)
+    
+    # API Keys / Tokens
+    api_patterns = [
+        r'api[_-]?key[=:"\s]+([a-zA-Z0-9_-]{20,})',
+        r'apikey[=:"\s]+([a-zA-Z0-9_-]{20,})',
+        r'access[_-]?token[=:"\s]+([a-zA-Z0-9_.-]{20,})',
+        r'bearer[\s]+([a-zA-Z0-9_.-]{20,})',
+        r'authorization[=:"\s]+([a-zA-Z0-9_.-]{20,})',
+    ]
+    for pattern in api_patterns:
+        matches = re.findall(pattern, payload, re.IGNORECASE)
+        confidential['api_keys'].extend(matches)
+    
+    # JWT Tokens
+    jwt_pattern = r'eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*'
+    confidential['tokens'] = re.findall(jwt_pattern, payload)
+    
+    # Cookies
+    cookie_patterns = [
+        r'cookie[=:"\s]+([^\s;]{5,})',
+        r'session[_-]?id[=:"\s]+([^\s;"]{5,})',
+        r'PHPSESSID[=:]+([^\s;"]{5,})',
+        r'JSESSIONID[=:]+([^\s;"]{5,})',
+    ]
+    for pattern in cookie_patterns:
+        matches = re.findall(pattern, payload, re.IGNORECASE)
+        confidential['cookies'].extend(matches)
+    
+    # Auth headers
+    auth_patterns = [
+        r'Authorization:\s*([^\r\n]{10,})',
+        r'X-Auth-Token:\s*([^\r\n]{10,})',
+        r'X-API-Key:\s*([^\r\n]{10,})',
+    ]
+    for pattern in auth_patterns:
+        matches = re.findall(pattern, payload, re.IGNORECASE)
+        confidential['auth_headers'].extend(matches)
+    
+    # Sensitive keywords
+    sensitive_words = [
+        'password', 'passwd', 'secret', 'private', 'confidential',
+        'ssn', 'social security', 'credit card', 'cvv', 'pin',
+        'bank', 'account', 'routing', 'swift', 'iban'
+    ]
+    for word in sensitive_words:
+        if word.lower() in payload.lower():
+            confidential['sensitive_keywords'].append(word)
+    
+    return confidential
+
+
+def get_deep_threat_intelligence(ip: str) -> Dict[str, Any]:
+    """Perform deep reverse engineering and threat intelligence on an IP address."""
+    intel = {
+        'ip': ip,
+        'whois': {},
+        'geolocation': {},
+        'reverse_dns': None,
+        'threat_reports': [],
+        'associated_domains': [],
+        'abuse_reports': [],
+        'ssl_certificates': [],
+        'open_ports': [],
+        'os_fingerprint': None,
+        'device_type': 'Unknown',
+        'reputation_score': 0,
+        'threat_categories': [],
+        'first_seen': None,
+        'last_seen': None,
+        'related_ips': [],
+        'is_tor_exit': False,
+        'is_vpn': False,
+        'is_proxy': False,
+        'is_datacenter': False,
+        'isp_info': {},
+        'network_info': {}
+    }
+    
+    # Check if private IP
+    if ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.16.'):
+        intel['is_private'] = True
+        intel['network_info']['type'] = 'Private/LAN'
+        return intel
+    
+    intel['is_private'] = False
+    
+    # Reverse DNS
+    try:
+        import socket
+        intel['reverse_dns'] = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        intel['reverse_dns'] = 'No PTR record'
+    
+    # WHOIS lookup
+    try:
+        import subprocess
+        result = subprocess.run(['nslookup', ip], capture_output=True, text=True, timeout=5,
+                                  encoding='utf-8', errors='ignore')
+        intel['whois']['raw'] = result.stdout
+    except Exception:
+        pass
+    
+    # IP-API for geolocation and ISP info (free API)
+    try:
+        resp = requests.get(f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,asname,reverse,mobile,proxy,hosting,query", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('status') == 'success':
+                intel['geolocation'] = {
+                    'country': data.get('country', 'Unknown'),
+                    'country_code': data.get('countryCode', 'XX'),
+                    'region': data.get('regionName', 'Unknown'),
+                    'city': data.get('city', 'Unknown'),
+                    'zip': data.get('zip', 'Unknown'),
+                    'latitude': data.get('lat', 0),
+                    'longitude': data.get('lon', 0),
+                    'timezone': data.get('timezone', 'Unknown')
+                }
+                intel['isp_info'] = {
+                    'isp': data.get('isp', 'Unknown'),
+                    'organization': data.get('org', 'Unknown'),
+                    'asn': data.get('as', 'Unknown'),
+                    'asn_name': data.get('asname', 'Unknown')
+                }
+                intel['is_proxy'] = data.get('proxy', False)
+                intel['is_datacenter'] = data.get('hosting', False)
+                intel['is_vpn'] = data.get('proxy', False) or data.get('hosting', False)
+    except Exception as e:
+        app_logger.debug(f"IP-API lookup failed: {e}")
+    
+    # VirusTotal check for threat info
+    if Config.VIRUSTOTAL_API_KEY:
+        try:
+            headers = {"x-apikey": Config.VIRUSTOTAL_API_KEY}
+            url = Config.VIRUSTOTAL_IP_URL.format(ip)
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                attrs = data.get('data', {}).get('attributes', {})
+                stats = attrs.get('last_analysis_stats', {})
+                
+                intel['reputation_score'] = attrs.get('reputation', 0)
+                intel['threat_reports'] = []
+                
+                # Get detailed vendor reports
+                results = attrs.get('last_analysis_results', {})
+                for vendor, result in results.items():
+                    if result.get('category') in ['malicious', 'suspicious']:
+                        intel['threat_reports'].append({
+                            'vendor': vendor,
+                            'category': result.get('category'),
+                            'result': result.get('result', 'Flagged'),
+                            'method': result.get('method', 'Unknown')
+                        })
+                
+                # Get associated domains/URLs
+                intel['associated_domains'] = attrs.get('last_https_certificate', {}).get('extensions', {}).get('subject_alternative_name', [])[:10]
+                
+                # Check for Tor/VPN indicators
+                if 'tor' in str(attrs).lower():
+                    intel['is_tor_exit'] = True
+                if 'vpn' in str(attrs).lower() or 'proxy' in str(attrs).lower():
+                    intel['is_vpn'] = True
+                    
+        except Exception as e:
+            app_logger.debug(f"VT threat intel failed: {e}")
+    
+    # AbuseIPDB check (if API key available - free tier available)
+    abuse_api_key = os.getenv('ABUSEIPDB_API_KEY', '')
+    if abuse_api_key:
+        try:
+            headers = {'Key': abuse_api_key, 'Accept': 'application/json'}
+            resp = requests.get(f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json().get('data', {})
+                intel['abuse_reports'] = {
+                    'total_reports': data.get('totalReports', 0),
+                    'confidence_score': data.get('abuseConfidenceScore', 0),
+                    'is_whitelisted': data.get('isWhitelisted', False),
+                    'last_reported': data.get('lastReportedAt'),
+                    'usage_type': data.get('usageType', 'Unknown'),
+                    'domain': data.get('domain', 'Unknown')
+                }
+        except Exception:
+            pass
+    
+    # Calculate threat categories
+    if intel['threat_reports']:
+        categories = set()
+        for report in intel['threat_reports']:
+            result = report.get('result', '').lower()
+            if 'malware' in result or 'trojan' in result:
+                categories.add('Malware Distribution')
+            if 'phish' in result:
+                categories.add('Phishing')
+            if 'spam' in result:
+                categories.add('Spam')
+            if 'c2' in result or 'command' in result or 'control' in result:
+                categories.add('C2 Server')
+            if 'botnet' in result:
+                categories.add('Botnet')
+            if 'scan' in result:
+                categories.add('Port Scanning')
+        intel['threat_categories'] = list(categories) if categories else ['Suspicious Activity']
+    
+    return intel
+
+
+def get_ssl_certificate_info(ip: str, port: int = 443) -> Dict[str, Any]:
+    """Extract SSL/TLS certificate information from a host."""
+    import ssl
+    import socket
+    from datetime import datetime
+    
+    cert_info = {
+        'valid': False,
+        'error': None,
+        'subject': {},
+        'issuer': {},
+        'version': None,
+        'serial_number': None,
+        'not_before': None,
+        'not_after': None,
+        'expired': False,
+        'days_until_expiry': None,
+        'san': [],
+        'signature_algorithm': None,
+        'key_size': None,
+        'is_self_signed': False,
+        'cipher_suite': None,
+        'tls_version': None,
+        'vulnerabilities': []
+    }
+    
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        
+        with socket.create_connection((ip, port), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=ip) as ssock:
+                cert = ssock.getpeercert(binary_form=False)
+                cert_bin = ssock.getpeercert(binary_form=True)
+                
+                if cert:
+                    cert_info['valid'] = True
+                    cert_info['cipher_suite'] = ssock.cipher()[0]
+                    cert_info['tls_version'] = ssock.version()
+                    
+                    # Parse certificate
+                    if 'subject' in cert:
+                        for rdn in cert['subject']:
+                            for key, value in rdn:
+                                cert_info['subject'][key] = value
+                    
+                    if 'issuer' in cert:
+                        for rdn in cert['issuer']:
+                            for key, value in rdn:
+                                cert_info['issuer'][key] = value
+                    
+                    # Check self-signed
+                    if cert_info['subject'] == cert_info['issuer']:
+                        cert_info['is_self_signed'] = True
+                        cert_info['vulnerabilities'].append('Self-signed certificate')
+                    
+                    # Check expiry
+                    if 'notAfter' in cert:
+                        cert_info['not_after'] = cert['notAfter']
+                        try:
+                            expiry = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                            cert_info['days_until_expiry'] = (expiry - datetime.now()).days
+                            if cert_info['days_until_expiry'] < 0:
+                                cert_info['expired'] = True
+                                cert_info['vulnerabilities'].append('Certificate expired')
+                            elif cert_info['days_until_expiry'] < 30:
+                                cert_info['vulnerabilities'].append('Certificate expiring soon')
+                        except Exception:
+                            pass
+                    
+                    if 'notBefore' in cert:
+                        cert_info['not_before'] = cert['notBefore']
+                    
+                    # Subject Alternative Names
+                    if 'subjectAltName' in cert:
+                        cert_info['san'] = [x[1] for x in cert['subjectAltName']]
+                    
+                    # Check for weak TLS
+                    if cert_info['tls_version'] in ['SSLv2', 'SSLv3', 'TLSv1', 'TLSv1.1']:
+                        cert_info['vulnerabilities'].append(f'Weak TLS version: {cert_info["tls_version"]}')
+                    
+                    # Check for weak ciphers
+                    weak_ciphers = ['RC4', 'DES', 'MD5', 'NULL', 'EXPORT', 'anon']
+                    if any(weak in str(cert_info['cipher_suite']).upper() for weak in weak_ciphers):
+                        cert_info['vulnerabilities'].append(f'Weak cipher suite: {cert_info["cipher_suite"]}')
+                        
+    except ssl.SSLError as e:
+        cert_info['error'] = f"SSL Error: {str(e)}"
+    except socket.timeout:
+        cert_info['error'] = "Connection timeout"
+    except ConnectionRefusedError:
+        cert_info['error'] = "Connection refused"
+    except Exception as e:
+        cert_info['error'] = str(e)
+    
+    return cert_info
+
+
+def enhanced_network_scan(router_ip: str, timeout: int = 3) -> List[Dict[str, Any]]:
+    """Enhanced network scan using multiple methods to find ALL devices."""
+    devices = {}
+    
+    if not SCAPY_AVAILABLE:
+        return []
+    
+    try:
+        # Method 1: ARP Scan (Layer 2 - finds all active devices)
+        ip_range = router_ip.rsplit('.', 1)[0] + '.1/24'
+        try:
+            ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip_range), timeout=timeout, verbose=0)
+            for snd, rcv in ans:
+                ip = rcv.psrc
+                mac = rcv.hwsrc
+                devices[ip] = {
+                    'ip': ip,
+                    'mac': mac,
+                    'discovery_method': 'ARP',
+                    'hostname': None,
+                    'vendor': None,
+                    'device_type': 'Unknown',
+                    'os_hint': None,
+                    'open_ports': []
+                }
+        except Exception as e:
+            app_logger.debug(f"ARP scan error: {e}")
+        
+        # Method 2: ICMP Ping Sweep (finds devices that respond to ping)
+        import subprocess
+        base_ip = router_ip.rsplit('.', 1)[0]
+        
+        def ping_host(ip):
+            try:
+                result = subprocess.run(
+                    ['ping', '-n', '1', '-w', '500', ip],
+                    capture_output=True, text=True, timeout=2
+                )
+                return result.returncode == 0
+            except Exception:
+                return False
+        
+        # Quick ping sweep for hosts not found by ARP
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            futures = {}
+            for i in range(1, 255):
+                ip = f"{base_ip}.{i}"
+                if ip not in devices:
+                    futures[executor.submit(ping_host, ip)] = ip
+            
+            for future in futures:
+                ip = futures[future]
+                try:
+                    if future.result():
+                        if ip not in devices:
+                            devices[ip] = {
+                                'ip': ip,
+                                'mac': 'Unknown (ICMP only)',
+                                'discovery_method': 'ICMP',
+                                'hostname': None,
+                                'vendor': None,
+                                'device_type': 'Unknown',
+                                'os_hint': None,
+                                'open_ports': []
+                            }
+                except Exception:
+                    pass
+        
+        # Method 3: NetBIOS scan for Windows devices
+        try:
+            result = subprocess.run(['nbtstat', '-n'], capture_output=True, text=True, timeout=5,
+                                      encoding='utf-8', errors='ignore')
+            # Parse NetBIOS info...
+        except Exception:
+            pass
+        
+        # Resolve hostnames and get additional info for each device
+        import socket
+        for ip, dev in devices.items():
+            # Hostname lookup
+            try:
+                dev['hostname'] = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                dev['hostname'] = ip
+            
+            # MAC vendor lookup
+            if dev['mac'] and dev['mac'] != 'Unknown (ICMP only)':
+                dev['vendor'] = get_mac_vendor(dev['mac'])
+            
+            # Device type detection
+            dev['device_type'] = detect_device_type(dev['vendor'] or '', dev['hostname'] or '')
+            
+            # OS fingerprinting hint from TTL
+            try:
+                result = subprocess.run(['ping', '-n', '1', '-w', '1000', ip], capture_output=True, text=True, timeout=3,
+                                          encoding='utf-8', errors='ignore')
+                if 'TTL=' in result.stdout:
+                    ttl = int(result.stdout.split('TTL=')[1].split()[0])
+                    if ttl <= 64:
+                        dev['os_hint'] = 'Linux/Unix/Android/iOS'
+                    elif ttl <= 128:
+                        dev['os_hint'] = 'Windows'
+                    else:
+                        dev['os_hint'] = 'Network Device/Solaris'
+            except Exception:
+                pass
+        
+        return list(devices.values())
+        
+    except Exception as e:
+        app_logger.error(f"Enhanced network scan failed: {e}")
+        return []
+
+
+def analyze_tls_traffic(packet_data: bytes) -> Dict[str, Any]:
+    """Analyze TLS/SSL traffic metadata (without decryption)."""
+    analysis = {
+        'is_tls': False,
+        'tls_version': None,
+        'content_type': None,
+        'handshake_type': None,
+        'cipher_suites': [],
+        'sni_hostname': None,
+        'session_id': None,
+        'extensions': [],
+        'alerts': [],
+        'security_issues': []
+    }
+    
+    if len(packet_data) < 5:
+        return analysis
+    
+    # TLS Record Header
+    content_type = packet_data[0]
+    if content_type not in [20, 21, 22, 23]:  # Change Cipher, Alert, Handshake, Application
+        return analysis
+    
+    analysis['is_tls'] = True
+    analysis['content_type'] = {
+        20: 'Change Cipher Spec',
+        21: 'Alert',
+        22: 'Handshake',
+        23: 'Application Data'
+    }.get(content_type, 'Unknown')
+    
+    # TLS Version
+    version_major = packet_data[1]
+    version_minor = packet_data[2]
+    version_map = {
+        (3, 0): 'SSLv3 (INSECURE!)',
+        (3, 1): 'TLSv1.0 (Deprecated)',
+        (3, 2): 'TLSv1.1 (Deprecated)',
+        (3, 3): 'TLSv1.2',
+        (3, 4): 'TLSv1.3'
+    }
+    analysis['tls_version'] = version_map.get((version_major, version_minor), f'Unknown ({version_major}.{version_minor})')
+    
+    # Security warnings
+    if (version_major, version_minor) in [(3, 0), (3, 1), (3, 2)]:
+        analysis['security_issues'].append(f'Weak TLS version detected: {analysis["tls_version"]}')
+    
+    # Try to extract SNI (Server Name Indication) from ClientHello
+    if content_type == 22 and len(packet_data) > 43:  # Handshake
+        try:
+            handshake_type = packet_data[5]
+            if handshake_type == 1:  # ClientHello
+                analysis['handshake_type'] = 'ClientHello'
+                # Skip to extensions and look for SNI (extension type 0)
+                # This is a simplified extraction
+                data_str = packet_data.decode('latin-1', errors='ignore')
+                # Look for readable hostnames in the SNI
+                import re
+                sni_matches = re.findall(r'([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}', data_str)
+                if sni_matches:
+                    analysis['sni_hostname'] = sni_matches[0] if sni_matches else None
+        except Exception:
+            pass
+    
+    return analysis
+
+
 def get_router_and_devices():
     """Discover router IP and connected network devices using ARP scan."""
     if not (NETIFACES_AVAILABLE and SCAPY_AVAILABLE):
@@ -948,41 +1567,298 @@ def run_gui():
     # --- Network Packet Tab ---
     packet_frame = ttk.Frame(notebook)
     notebook.add(packet_frame, text='📦 Network Packets')
-    pkt_columns = ("Time", "Source", "Destination", "Protocol", "Info", "Threat")
+    
+    # Packet tab header with controls
+    pkt_header = ttk.Frame(packet_frame)
+    pkt_header.pack(fill=tk.X, padx=5, pady=5)
+    
+    pkt_status_var = tk.StringVar(value="📡 Capturing packets... Double-click to inspect & extract confidential data")
+    ttk.Label(pkt_header, textvariable=pkt_status_var, font=('Segoe UI', 9)).pack(side=tk.LEFT)
+    
+    # Stats for captured confidential data
+    confidential_count = tk.IntVar(value=0)
+    ttk.Label(pkt_header, text="🔴 Confidential Found:", font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT, padx=(10, 0))
+    ttk.Label(pkt_header, textvariable=confidential_count, font=('Segoe UI', 9, 'bold'), foreground='#dc3545').pack(side=tk.RIGHT)
+    
+    pkt_columns = ("Time", "Source", "Destination", "Protocol", "Info", "Threat", "Confidential")
     pkt_tree = ttk.Treeview(packet_frame, columns=pkt_columns, show="headings", height=15)
     for col in pkt_columns:
         pkt_tree.heading(col, text=col)
-        pkt_tree.column(col, width=120 if col!="Info" else 220)
+        if col == "Info":
+            pkt_tree.column(col, width=200)
+        elif col == "Confidential":
+            pkt_tree.column(col, width=100)
+        else:
+            pkt_tree.column(col, width=110)
+    
+    # Color tags for packets with confidential data
+    pkt_tree.tag_configure('confidential', background='#f8d7da', foreground='#721c24')
+    pkt_tree.tag_configure('suspicious', background='#fff3cd', foreground='#856404')
+    pkt_tree.tag_configure('clean', background='#d4edda', foreground='#155724')
+    
     pkt_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     if not SCAPY_AVAILABLE:
-        pkt_tree.insert("", 0, values=("-", "-", "-", "-", "Install scapy for packet capture", "-"))
+        pkt_tree.insert("", 0, values=("-", "-", "-", "-", "Install scapy for packet capture", "-", "-"))
 
-    # Human-readable packet details popup
+    # Store extracted confidential data from packets
+    packet_confidential_data = {}  # packet_idx -> extracted data
+
+    # Human-readable packet details popup with confidential data extraction
     def show_packet_details(event):
         item = pkt_tree.identify_row(event.y)
         if not item:
             return
         values = pkt_tree.item(item)['values']
-        details = f"Time: {values[0]}\nSource: {values[1]}\nDestination: {values[2]}\nProtocol: {values[3]}\nInfo: {values[4]}\nThreat: {values[5]}"
+        
+        # Create detailed popup window
+        popup = tk.Toplevel(root)
+        popup.title(f"🔍 Packet Analysis - {values[1]} → {values[2]}")
+        popup.geometry("800x650")
+        popup.configure(bg='#f8f9fa')
+        
+        # Create notebook for tabs
+        detail_notebook = ttk.Notebook(popup)
+        detail_notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Tab 1: Basic Info
+        basic_frame = ttk.Frame(detail_notebook)
+        detail_notebook.add(basic_frame, text="📋 Basic Info")
+        
+        basic_text = tk.Text(basic_frame, height=20, font=('Consolas', 10), bg='#ffffff')
+        basic_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        basic_info = f"""
+═══════════════════════════════════════════════════════════
+                    PACKET ANALYSIS REPORT
+═══════════════════════════════════════════════════════════
+
+📅 Capture Time:    {values[0]}
+📤 Source:          {values[1]}
+📥 Destination:     {values[2]}
+📡 Protocol:        {values[3]}
+ℹ️  Info:            {values[4]}
+⚠️  Threat Level:    {values[5]}
+🔐 Confidential:    {values[6]}
+
+"""
+        
         try:
             idx = pkt_tree.index(item)
             if 'captured_packets' in globals() and idx < len(captured_packets):
                 pkt = captured_packets[idx]
                 from scapy.all import hexdump
-                details += "\n\nRaw Packet (hex):\n" + hexdump(pkt, dump=True)
+                
                 if pkt.haslayer('TCP'):
-                    details += f"\nTCP Flags: {pkt['TCP'].flags} Seq: {pkt['TCP'].seq} Ack: {pkt['TCP'].ack}"
+                    basic_info += f"""
+═══════════════════════════════════════════════════════════
+                      TCP DETAILS
+═══════════════════════════════════════════════════════════
+🚩 TCP Flags:       {pkt['TCP'].flags}
+🔢 Sequence:        {pkt['TCP'].seq}
+✅ Acknowledgment:  {pkt['TCP'].ack}
+🚪 Source Port:     {pkt['TCP'].sport}
+🚪 Dest Port:       {pkt['TCP'].dport}
+📊 Window Size:     {pkt['TCP'].window}
+"""
+                
                 if pkt.haslayer('UDP'):
-                    details += f"\nUDP Len: {pkt['UDP'].len}"
+                    basic_info += f"""
+═══════════════════════════════════════════════════════════
+                      UDP DETAILS
+═══════════════════════════════════════════════════════════
+🚪 Source Port:     {pkt['UDP'].sport}
+🚪 Dest Port:       {pkt['UDP'].dport}
+📏 Length:          {pkt['UDP'].len}
+"""
+        except Exception:
+            pass
+        
+        basic_text.insert('1.0', basic_info)
+        basic_text.config(state=tk.DISABLED)
+        
+        # Tab 2: Payload & Raw Data
+        payload_frame = ttk.Frame(detail_notebook)
+        detail_notebook.add(payload_frame, text="📦 Payload Data")
+        
+        payload_text = tk.Text(payload_frame, height=20, font=('Consolas', 9), bg='#ffffff', wrap=tk.WORD)
+        payload_scroll = ttk.Scrollbar(payload_frame, orient="vertical", command=payload_text.yview)
+        payload_text.configure(yscrollcommand=payload_scroll.set)
+        payload_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        payload_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        payload_content = ""
+        raw_payload = ""
+        
+        try:
+            idx = pkt_tree.index(item)
+            if 'captured_packets' in globals() and idx < len(captured_packets):
+                pkt = captured_packets[idx]
+                from scapy.all import hexdump
+                
+                payload_content = "═══════════════════════════════════════════════════════════\\n"
+                payload_content += "                    RAW PACKET (HEX DUMP)\\n"
+                payload_content += "═══════════════════════════════════════════════════════════\\n\\n"
+                payload_content += hexdump(pkt, dump=True)
+                
                 if pkt.haslayer('Raw'):
                     raw = pkt['Raw'].load
                     try:
-                        details += f"\nPayload: {raw.decode(errors='replace')}"
+                        raw_payload = raw.decode(errors='replace')
+                        payload_content += "\\n\\n═══════════════════════════════════════════════════════════\\n"
+                        payload_content += "                    DECODED PAYLOAD\\n"
+                        payload_content += "═══════════════════════════════════════════════════════════\\n\\n"
+                        payload_content += raw_payload
                     except Exception:
-                        details += f"\nPayload: {raw}"
-        except Exception:
-            pass
-        messagebox.showinfo("Packet Details", details)
+                        payload_content += f"\\n\\nBinary Payload: {raw}"
+        except Exception as e:
+            payload_content = f"Could not extract payload: {e}"
+        
+        payload_text.insert('1.0', payload_content)
+        payload_text.config(state=tk.DISABLED)
+        
+        # Tab 3: Confidential Data Extraction
+        confid_frame = ttk.Frame(detail_notebook)
+        detail_notebook.add(confid_frame, text="🔴 Confidential Data")
+        
+        confid_header = ttk.Frame(confid_frame)
+        confid_header.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Label(confid_header, text="⚠️ EXTRACTED SENSITIVE INFORMATION", 
+                  font=('Segoe UI', 11, 'bold'), foreground='#dc3545').pack(anchor='w')
+        ttk.Label(confid_header, text="This data was automatically extracted from the packet payload.", 
+                  font=('Segoe UI', 9)).pack(anchor='w')
+        
+        confid_text = tk.Text(confid_frame, height=18, font=('Consolas', 10), bg='#fff5f5', wrap=tk.WORD)
+        confid_scroll = ttk.Scrollbar(confid_frame, orient="vertical", command=confid_text.yview)
+        confid_text.configure(yscrollcommand=confid_scroll.set)
+        confid_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        confid_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Configure text tags for highlighting
+        confid_text.tag_configure('header', foreground='#dc3545', font=('Consolas', 10, 'bold'))
+        confid_text.tag_configure('value', foreground='#0066cc', font=('Consolas', 10, 'bold'))
+        confid_text.tag_configure('critical', foreground='#dc3545', background='#fff0f0', font=('Consolas', 10, 'bold'))
+        confid_text.tag_configure('warning', foreground='#fd7e14', font=('Consolas', 10))
+        
+        # Extract confidential data
+        extracted = extract_confidential_data(raw_payload)
+        
+        confid_content = "\\n"
+        has_confidential = False
+        
+        if extracted['passwords']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n🔑 PASSWORDS FOUND:\\n", 'header')
+            for pwd in extracted['passwords']:
+                confid_text.insert(tk.END, f"   → {pwd}\\n", 'critical')
+        
+        if extracted['usernames']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n👤 USERNAMES FOUND:\\n", 'header')
+            for user in extracted['usernames']:
+                confid_text.insert(tk.END, f"   → {user}\\n", 'value')
+        
+        if extracted['emails']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n📧 EMAIL ADDRESSES:\\n", 'header')
+            for email in extracted['emails']:
+                confid_text.insert(tk.END, f"   → {email}\\n", 'value')
+        
+        if extracted['credit_cards']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n💳 CREDIT CARD NUMBERS:\\n", 'header')
+            for cc in extracted['credit_cards']:
+                # Mask middle digits for display
+                masked = cc[:4] + '*' * (len(cc) - 8) + cc[-4:]
+                confid_text.insert(tk.END, f"   → {masked} (MASKED)\\n", 'critical')
+        
+        if extracted['api_keys']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n🔐 API KEYS / SECRETS:\\n", 'header')
+            for key in extracted['api_keys']:
+                confid_text.insert(tk.END, f"   → {key[:20]}...\\n", 'critical')
+        
+        if extracted['tokens']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n🎫 JWT/AUTH TOKENS:\\n", 'header')
+            for token in extracted['tokens']:
+                confid_text.insert(tk.END, f"   → {token[:50]}...\\n", 'critical')
+        
+        if extracted['cookies']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n🍪 SESSION COOKIES:\\n", 'header')
+            for cookie in extracted['cookies']:
+                confid_text.insert(tk.END, f"   → {cookie}\\n", 'warning')
+        
+        if extracted['auth_headers']:
+            has_confidential = True
+            confid_text.insert(tk.END, "\\n🔒 AUTHORIZATION HEADERS:\\n", 'header')
+            for auth in extracted['auth_headers']:
+                confid_text.insert(tk.END, f"   → {auth}\\n", 'critical')
+        
+        if extracted['sensitive_keywords']:
+            confid_text.insert(tk.END, "\\n⚠️ SENSITIVE KEYWORDS DETECTED:\\n", 'header')
+            for word in set(extracted['sensitive_keywords']):
+                confid_text.insert(tk.END, f"   • {word}\\n", 'warning')
+        
+        if not has_confidential:
+            confid_text.insert(tk.END, "\\n✅ No sensitive data detected in this packet.\\n", 'value')
+            confid_text.insert(tk.END, "\\nNote: Only unencrypted (HTTP, FTP, Telnet) traffic can be analyzed.\\n")
+            confid_text.insert(tk.END, "HTTPS/TLS encrypted traffic cannot reveal confidential data.\\n")
+        
+        confid_text.config(state=tk.DISABLED)
+        
+        # Button frame
+        btn_frame = ttk.Frame(popup)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        def copy_extracted():
+            report = f"PACKET CONFIDENTIAL DATA EXTRACTION\\n"
+            report += f"Time: {values[0]} | {values[1]} → {values[2]}\\n"
+            report += "=" * 50 + "\\n"
+            for key, vals in extracted.items():
+                if vals:
+                    report += f"\\n{key.upper()}:\\n"
+                    for v in vals:
+                        report += f"  - {v}\\n"
+            root.clipboard_clear()
+            root.clipboard_append(report)
+            messagebox.showinfo("Copied", "Extracted data copied to clipboard!")
+        
+        def export_packet():
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text Report", "*.txt"), ("JSON", "*.json")]
+            )
+            if file_path:
+                try:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        if file_path.endswith('.json'):
+                            json.dump({
+                                'packet_info': {
+                                    'time': str(values[0]),
+                                    'source': str(values[1]),
+                                    'destination': str(values[2]),
+                                    'protocol': str(values[3])
+                                },
+                                'extracted_data': extracted,
+                                'raw_payload': raw_payload
+                            }, f, indent=2)
+                        else:
+                            f.write(basic_info)
+                            f.write("\\n\\nPAYLOAD:\\n" + payload_content)
+                            f.write("\\n\\nEXTRACTED CONFIDENTIAL DATA:\\n")
+                            for key, vals in extracted.items():
+                                if vals:
+                                    f.write(f"\\n{key.upper()}:\\n")
+                                    for v in vals:
+                                        f.write(f"  - {v}\\n")
+                    messagebox.showinfo("Exported", f"Packet analysis exported to {file_path}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Export failed: {e}")
+        
+        ttk.Button(btn_frame, text="📋 Copy Extracted Data", command=copy_extracted).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="💾 Export Full Analysis", command=export_packet).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT, padx=5)
 
     pkt_tree.bind("<Double-1>", show_packet_details)
 
@@ -1126,7 +2002,7 @@ def run_gui():
         """Enhanced network scan with device discovery and traffic monitoring."""
         nonlocal discovered_devices
         
-        map_status_var.set("🔄 Scanning network... Please wait.")
+        map_status_var.set("🔄 Starting comprehensive network scan... Please wait.")
         map_tree.delete(*map_tree.get_children())
         discovered_devices = {}
         
@@ -1142,8 +2018,14 @@ def run_gui():
             return
         
         try:
-            # Get router and initial device list
-            router_ip, devices = get_router_and_devices()
+            # Get gateway/router IP
+            gateways = netifaces.gateways() if NETIFACES_AVAILABLE else {}
+            router_ip = gateways.get('default', {}).get(netifaces.AF_INET, [None])[0] if NETIFACES_AVAILABLE else None
+            
+            if not router_ip:
+                map_status_var.set("❌ Could not detect gateway. Check network connection.")
+                scan_running.set(False)
+                return
             
             if not scan_running.get():
                 return
@@ -1162,7 +2044,7 @@ def run_gui():
                 router_info = get_ip_info(router_ip)
                 discovered_devices[router_ip] = {
                     'ip': router_ip,
-                    'mac': 'N/A',
+                    'mac': 'Gateway',
                     'hostname': router_info['hostname'],
                     'vendor': 'Gateway',
                     'type': 'Router',
@@ -1170,18 +2052,31 @@ def run_gui():
                     'bytes_sent': total_sent,
                     'bytes_recv': total_recv,
                     'last_seen': now,
-                    'info': router_info
+                    'info': router_info,
+                    'os_hint': 'Network Device'
                 }
                 map_tree.insert("", "end", 
-                    values=(router_ip, 'N/A', router_info['hostname'], 'Gateway', 'Router', 
+                    values=(router_ip, 'Gateway', router_info['hostname'], 'Gateway', 'Router', 
                             '🟢 Active', format_bytes(total_sent), format_bytes(total_recv), now),
                     tags=('router',))
                 type_counts['Router'] = 1
                 device_count += 1
-                map_status_var.set(f"🔄 Found router: {router_ip}. Scanning devices...")
+                map_status_var.set(f"🔄 Found router: {router_ip}. Starting multi-method scan...")
+            
+            # Use enhanced network scan for ALL devices
+            map_status_var.set("🔄 Phase 1: ARP scanning local network...")
+            root.update_idletasks()
+            
+            all_devices = enhanced_network_scan(router_ip, timeout=3)
+            
+            if not scan_running.get():
+                return
+            
+            map_status_var.set(f"🔄 Phase 2: Processing {len(all_devices)} discovered devices...")
+            root.update_idletasks()
             
             # Process each discovered device
-            for i, dev in enumerate(devices):
+            for i, dev in enumerate(all_devices):
                 if not scan_running.get():
                     break
                 
@@ -1189,62 +2084,110 @@ def run_gui():
                 if ip == router_ip:
                     continue
                 
-                mac = dev['mac']
-                hostname = dev.get('name', ip)
+                mac = dev.get('mac', 'Unknown')
+                hostname = dev.get('hostname', ip)
+                vendor = dev.get('vendor', 'Unknown')
+                dtype = dev.get('device_type', 'Unknown')
+                os_hint = dev.get('os_hint', 'Unknown')
                 
-                # Get vendor
-                vendor = lookup_vendor(mac)
+                # Get detailed IP info if not already have hostname
+                if hostname == ip:
+                    ip_info = get_ip_info(ip)
+                    if ip_info['hostname'] != 'Unknown':
+                        hostname = ip_info['hostname']
+                else:
+                    ip_info = get_ip_info(ip)
                 
-                # Guess device type
-                dtype = guess_device_type(hostname, vendor)
+                # Refine device type based on vendor and hostname
+                if vendor and vendor != 'Unknown':
+                    dtype = guess_device_type(hostname, vendor)
                 
-                # Get detailed IP info
-                ip_info = get_ip_info(ip)
-                if ip_info['hostname'] != 'Unknown':
-                    hostname = ip_info['hostname']
+                # Enhanced OS detection from hostname patterns
+                hostname_lower = hostname.lower() if hostname else ""
+                if 'iphone' in hostname_lower or 'ipad' in hostname_lower:
+                    dtype = 'iOS Device'
+                    os_hint = 'iOS'
+                elif 'android' in hostname_lower or 'galaxy' in hostname_lower or 'samsung' in hostname_lower:
+                    dtype = 'Android Device'
+                    os_hint = 'Android'
+                elif 'macbook' in hostname_lower or 'imac' in hostname_lower:
+                    dtype = 'Apple Computer'
+                    os_hint = 'macOS'
+                elif any(x in hostname_lower for x in ['desktop', 'laptop', 'pc', 'win']):
+                    dtype = 'Windows PC'
+                    os_hint = 'Windows'
+                
+                # Vendor-based detection
+                if vendor:
+                    vendor_lower = vendor.lower()
+                    if 'apple' in vendor_lower:
+                        if dtype == 'Unknown':
+                            dtype = 'Apple Device'
+                    elif 'samsung' in vendor_lower:
+                        if dtype == 'Unknown':
+                            dtype = 'Samsung Device'
+                        if os_hint == 'Unknown' or os_hint is None:
+                            os_hint = 'Android (Samsung)'
+                    elif any(x in vendor_lower for x in ['huawei', 'xiaomi', 'oppo', 'vivo', 'oneplus']):
+                        dtype = 'Android Phone'
+                        os_hint = 'Android'
+                    elif 'amazon' in vendor_lower:
+                        dtype = 'Smart Device (Amazon)'
+                    elif 'google' in vendor_lower:
+                        dtype = 'Google Device'
+                    elif 'intel' in vendor_lower or 'realtek' in vendor_lower:
+                        if dtype == 'Unknown':
+                            dtype = 'Computer'
                 
                 # Check if device is still reachable (ping)
                 status = 'Active'
                 try:
-                    # Quick ping check
-                    if SCAPY_AVAILABLE:
-                        from scapy.all import sr1, ICMP, IP as ScapyIP
-                        pkt = sr1(ScapyIP(dst=ip)/ICMP(), timeout=1, verbose=0)
-                        status = 'Active' if pkt else 'Inactive'
+                    import subprocess
+                    result = subprocess.run(['ping', '-n', '1', '-w', '500', ip], 
+                                          capture_output=True, timeout=2,
+                                          encoding='utf-8', errors='ignore')
+                    status = 'Active' if result.returncode == 0 else 'Inactive'
                 except Exception:
                     status = 'Unknown'
                 
                 # Estimate traffic (proportional distribution for now)
-                device_sent = total_sent // max(len(devices), 1)
-                device_recv = total_recv // max(len(devices), 1)
+                device_sent = total_sent // max(len(all_devices), 1)
+                device_recv = total_recv // max(len(all_devices), 1)
                 
                 # Store device info
                 discovered_devices[ip] = {
                     'ip': ip,
                     'mac': mac,
                     'hostname': hostname,
-                    'vendor': vendor,
+                    'vendor': vendor or 'Unknown',
                     'type': dtype,
                     'status': status,
                     'bytes_sent': device_sent,
                     'bytes_recv': device_recv,
                     'last_seen': now,
-                    'info': ip_info
+                    'info': ip_info,
+                    'os_hint': os_hint,
+                    'discovery_method': dev.get('discovery_method', 'ARP')
                 }
                 
                 # Determine row tag based on status
                 row_tag = 'active' if status == 'Active' else ('inactive' if status == 'Inactive' else 'unknown')
                 status_icon = '🟢' if status == 'Active' else ('🔴' if status == 'Inactive' else '🟡')
                 
+                # Add OS hint to device type display
+                display_type = dtype
+                if os_hint and os_hint != 'Unknown':
+                    display_type = f"{dtype} ({os_hint})"
+                
                 map_tree.insert("", "end",
-                    values=(ip, mac, hostname, vendor, dtype, f"{status_icon} {status}",
+                    values=(ip, mac, hostname, vendor or 'Unknown', display_type, f"{status_icon} {status}",
                             format_bytes(device_sent), format_bytes(device_recv), now),
                     tags=(row_tag,))
                 
                 type_counts[dtype] = type_counts.get(dtype, 0) + 1
                 device_count += 1
                 
-                map_status_var.set(f"🔄 Scanning... Found {device_count} devices ({i+1}/{len(devices)})")
+                map_status_var.set(f"🔄 Scanning... Found {device_count} devices ({i+1}/{len(all_devices)})")
                 root.update_idletasks()
             
             # Update analytics
@@ -1403,12 +2346,15 @@ def run_gui():
         
         # Router Credentials Section (only for router devices)
         if dev['type'] == 'Router':
-            creds_frame = ttk.LabelFrame(scrollable, text="🔐 Router Credentials")
+            creds_frame = ttk.LabelFrame(scrollable, text="🔐 Router & WiFi Credentials")
             creds_frame.pack(fill=tk.X, padx=15, pady=5)
             
             creds_status = tk.StringVar(value="🔒 Credentials hidden - Enter admin password to reveal")
-            creds_label = ttk.Label(creds_frame, textvariable=creds_status, font=('Segoe UI', 10))
-            creds_label.pack(padx=10, pady=5)
+            creds_label = ttk.Label(creds_frame, textvariable=creds_status, font=('Segoe UI', 10), wraplength=500, justify='left')
+            creds_label.pack(padx=10, pady=5, anchor='w')
+            
+            # WiFi passwords display area (hidden initially)
+            wifi_text_widget = None
             
             # Password entry frame
             pwd_frame = ttk.Frame(creds_frame)
@@ -1419,13 +2365,31 @@ def run_gui():
             pwd_entry.pack(side=tk.LEFT, padx=5)
             
             def reveal_credentials():
+                nonlocal wifi_text_widget
                 admin_pwd = "0000"  # Admin password
                 if pwd_entry.get() == admin_pwd:
                     # Get common router default credentials based on vendor
                     vendor = dev['vendor'].lower()
                     default_creds = get_router_default_credentials(vendor)
+                    
+                    # Get saved WiFi passwords
+                    wifi_passwords = get_saved_wifi_passwords()
+                    
+                    # Build WiFi password section
+                    wifi_section = ""
+                    if wifi_passwords:
+                        wifi_section = "\n\n📶 SAVED WIFI PASSWORDS\n" + "━" * 40 + "\n"
+                        for wifi in wifi_passwords:
+                            wifi_section += f"\n🌐 SSID: {wifi['ssid']}\n"
+                            wifi_section += f"   🔑 Password: {wifi['password']}\n"
+                            wifi_section += f"   🔒 Security: {wifi['authentication']} / {wifi['security']}\n"
+                    else:
+                        wifi_section = "\n\n📶 SAVED WIFI PASSWORDS\n" + "━" * 40 + "\n"
+                        wifi_section += "No saved WiFi profiles found or access denied.\n"
+                        wifi_section += "Run as Administrator for full access.\n"
+                    
                     creds_text = f"""🔓 ROUTER DEFAULT CREDENTIALS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Vendor: {dev['vendor']}
 Router IP: {dev['ip']}
 
@@ -1434,16 +2398,198 @@ Router IP: {dev['ip']}
 
 ⚠️ WARNING: Change default credentials immediately!
 Access router at: http://{dev['ip']}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
-                    creds_status.set(creds_text)
+{wifi_section}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+                    
+                    # Hide password entry
                     pwd_frame.pack_forget()
                     reveal_btn.pack_forget()
+                    creds_label.pack_forget()
+                    
+                    # Create scrollable text widget for credentials
+                    wifi_text_widget = tk.Text(creds_frame, height=15, width=60, font=('Consolas', 9), bg='#f8f9fa')
+                    wifi_text_widget.pack(padx=10, pady=5, fill=tk.X)
+                    wifi_text_widget.insert('1.0', creds_text)
+                    
+                    # Highlight passwords in red
+                    wifi_text_widget.tag_configure('password', foreground='#dc3545', font=('Consolas', 9, 'bold'))
+                    wifi_text_widget.tag_configure('ssid', foreground='#0066cc', font=('Consolas', 9, 'bold'))
+                    wifi_text_widget.tag_configure('warning', foreground='#fd7e14', font=('Consolas', 9, 'bold'))
+                    
+                    # Apply highlighting
+                    import re
+                    content = wifi_text_widget.get('1.0', tk.END)
+                    
+                    # Highlight passwords
+                    for match in re.finditer(r'Password: (.+)', content):
+                        start = f"1.0 + {match.start(1)} chars"
+                        end = f"1.0 + {match.end(1)} chars"
+                        wifi_text_widget.tag_add('password', start, end)
+                    
+                    # Highlight SSIDs
+                    for match in re.finditer(r'SSID: (.+)', content):
+                        start = f"1.0 + {match.start(1)} chars"
+                        end = f"1.0 + {match.end(1)} chars"
+                        wifi_text_widget.tag_add('ssid', start, end)
+                    
+                    wifi_text_widget.config(state=tk.DISABLED)
+                    
+                    # Add copy button for WiFi passwords
+                    def copy_wifi_creds():
+                        root.clipboard_clear()
+                        root.clipboard_append(creds_text)
+                        messagebox.showinfo("Copied", "Router & WiFi credentials copied to clipboard!")
+                    
+                    ttk.Button(creds_frame, text="📋 Copy Credentials", command=copy_wifi_creds).pack(pady=5)
                 else:
                     messagebox.showerror("Access Denied", "Invalid admin password!")
                     pwd_entry.delete(0, tk.END)
             
-            reveal_btn = ttk.Button(creds_frame, text="🔓 Reveal Credentials", command=reveal_credentials)
+            reveal_btn = ttk.Button(creds_frame, text="🔓 Reveal Credentials & WiFi Passwords", command=reveal_credentials)
             reveal_btn.pack(pady=5)
+        
+        # Deep Threat Intelligence Section (for external IPs or suspicious devices)
+        threat_intel_frame = ttk.LabelFrame(scrollable, text="🔬 Deep Threat Intelligence")
+        threat_intel_frame.pack(fill=tk.X, padx=15, pady=5)
+        
+        intel_status = tk.StringVar(value="Click 'Analyze Threat' to perform deep reverse engineering")
+        intel_label = ttk.Label(threat_intel_frame, textvariable=intel_status, font=('Segoe UI', 10), wraplength=500)
+        intel_label.pack(padx=10, pady=5)
+        
+        intel_text_widget = None
+        
+        def run_deep_intel():
+            nonlocal intel_text_widget
+            intel_status.set("🔄 Performing deep threat analysis... Please wait.")
+            popup.update_idletasks()
+            
+            # Get deep threat intelligence
+            intel = get_deep_threat_intelligence(ip)
+            
+            # Also try to get SSL cert info if not private
+            ssl_info = None
+            if not intel.get('is_private', True):
+                ssl_info = get_ssl_certificate_info(ip)
+            
+            # Build intelligence report
+            intel_report = "═" * 55 + "\n"
+            intel_report += "       🔬 DEEP THREAT INTELLIGENCE REPORT\n"
+            intel_report += "═" * 55 + "\n\n"
+            
+            intel_report += f"🎯 Target IP: {ip}\n"
+            intel_report += f"📅 Analysis Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            
+            if intel.get('is_private'):
+                intel_report += "ℹ️ This is a PRIVATE/LAN IP address.\n"
+                intel_report += "   External threat databases do not track private IPs.\n"
+                intel_report += "   Monitor this device locally for suspicious behavior.\n\n"
+            else:
+                # Geolocation
+                geo = intel.get('geolocation', {})
+                intel_report += "🌍 GEOLOCATION\n" + "─" * 40 + "\n"
+                intel_report += f"   Country:   {geo.get('country', 'Unknown')} ({geo.get('country_code', 'XX')})\n"
+                intel_report += f"   Region:    {geo.get('region', 'Unknown')}\n"
+                intel_report += f"   City:      {geo.get('city', 'Unknown')}\n"
+                intel_report += f"   ZIP:       {geo.get('zip', 'Unknown')}\n"
+                intel_report += f"   Coords:    {geo.get('latitude', 0)}, {geo.get('longitude', 0)}\n"
+                intel_report += f"   Timezone:  {geo.get('timezone', 'Unknown')}\n\n"
+                
+                # ISP Info
+                isp = intel.get('isp_info', {})
+                intel_report += "🏢 ISP & ORGANIZATION\n" + "─" * 40 + "\n"
+                intel_report += f"   ISP:       {isp.get('isp', 'Unknown')}\n"
+                intel_report += f"   Org:       {isp.get('organization', 'Unknown')}\n"
+                intel_report += f"   ASN:       {isp.get('asn', 'Unknown')}\n"
+                intel_report += f"   ASN Name:  {isp.get('asn_name', 'Unknown')}\n\n"
+                
+                # Threat Indicators
+                intel_report += "⚠️ THREAT INDICATORS\n" + "─" * 40 + "\n"
+                intel_report += f"   🔄 Is Proxy/VPN:    {'Yes ⚠️' if intel.get('is_vpn') else 'No'}\n"
+                intel_report += f"   🌐 Is Tor Exit:     {'Yes ⚠️' if intel.get('is_tor_exit') else 'No'}\n"
+                intel_report += f"   🏢 Is Datacenter:   {'Yes' if intel.get('is_datacenter') else 'No'}\n"
+                intel_report += f"   📊 Reputation:      {intel.get('reputation_score', 'N/A')}\n\n"
+                
+                # Threat Categories
+                if intel.get('threat_categories'):
+                    intel_report += "🚨 THREAT CATEGORIES\n" + "─" * 40 + "\n"
+                    for cat in intel['threat_categories']:
+                        intel_report += f"   • {cat}\n"
+                    intel_report += "\n"
+                
+                # Vendor Reports
+                if intel.get('threat_reports'):
+                    intel_report += "🦠 SECURITY VENDOR REPORTS\n" + "─" * 40 + "\n"
+                    for report in intel['threat_reports'][:10]:  # Limit to 10
+                        intel_report += f"   [{report.get('category', 'Unknown').upper()}] "
+                        intel_report += f"{report.get('vendor', 'Unknown')}: {report.get('result', 'Flagged')}\n"
+                    intel_report += "\n"
+                
+                # Abuse Reports
+                if intel.get('abuse_reports') and isinstance(intel['abuse_reports'], dict):
+                    abuse = intel['abuse_reports']
+                    intel_report += "🚫 ABUSE REPORTS (AbuseIPDB)\n" + "─" * 40 + "\n"
+                    intel_report += f"   Total Reports:     {abuse.get('total_reports', 0)}\n"
+                    intel_report += f"   Confidence Score:  {abuse.get('confidence_score', 0)}%\n"
+                    intel_report += f"   Usage Type:        {abuse.get('usage_type', 'Unknown')}\n"
+                    intel_report += f"   Domain:            {abuse.get('domain', 'Unknown')}\n"
+                    intel_report += f"   Last Reported:     {abuse.get('last_reported', 'Never')}\n\n"
+                
+                # SSL/TLS Certificate Info
+                if ssl_info and ssl_info.get('valid'):
+                    intel_report += "🔐 SSL/TLS CERTIFICATE\n" + "─" * 40 + "\n"
+                    intel_report += f"   TLS Version:    {ssl_info.get('tls_version', 'Unknown')}\n"
+                    intel_report += f"   Cipher Suite:   {ssl_info.get('cipher_suite', 'Unknown')}\n"
+                    
+                    subj = ssl_info.get('subject', {})
+                    if subj:
+                        intel_report += f"   Subject CN:     {subj.get('commonName', 'Unknown')}\n"
+                        intel_report += f"   Subject Org:    {subj.get('organizationName', 'Unknown')}\n"
+                    
+                    issuer = ssl_info.get('issuer', {})
+                    if issuer:
+                        intel_report += f"   Issuer:         {issuer.get('commonName', 'Unknown')}\n"
+                    
+                    intel_report += f"   Expires:        {ssl_info.get('not_after', 'Unknown')}\n"
+                    intel_report += f"   Days Left:      {ssl_info.get('days_until_expiry', 'Unknown')}\n"
+                    intel_report += f"   Self-Signed:    {'Yes ⚠️' if ssl_info.get('is_self_signed') else 'No'}\n"
+                    
+                    if ssl_info.get('vulnerabilities'):
+                        intel_report += "\n   ⚠️ VULNERABILITIES:\n"
+                        for vuln in ssl_info['vulnerabilities']:
+                            intel_report += f"      • {vuln}\n"
+                    intel_report += "\n"
+                elif ssl_info and ssl_info.get('error'):
+                    intel_report += "🔐 SSL/TLS CERTIFICATE\n" + "─" * 40 + "\n"
+                    intel_report += f"   Status: {ssl_info.get('error')}\n\n"
+                
+                # Associated Domains
+                if intel.get('associated_domains'):
+                    intel_report += "🌐 ASSOCIATED DOMAINS\n" + "─" * 40 + "\n"
+                    for domain in intel['associated_domains'][:5]:
+                        intel_report += f"   • {domain}\n"
+                    intel_report += "\n"
+            
+            intel_report += "═" * 55 + "\n"
+            
+            # Display in text widget
+            if intel_text_widget:
+                intel_text_widget.destroy()
+            
+            intel_text_widget = tk.Text(threat_intel_frame, height=12, width=60, font=('Consolas', 9), bg='#fff8f0', wrap=tk.WORD)
+            intel_text_widget.pack(padx=10, pady=5, fill=tk.X)
+            intel_text_widget.insert('1.0', intel_report)
+            
+            # Configure tags for highlighting
+            intel_text_widget.tag_configure('warning', foreground='#dc3545', font=('Consolas', 9, 'bold'))
+            intel_text_widget.tag_configure('header', foreground='#0066cc', font=('Consolas', 9, 'bold'))
+            
+            intel_text_widget.config(state=tk.DISABLED)
+            intel_status.set("✅ Analysis complete. See detailed report below.")
+            
+            # Update popup window size to accommodate new content
+            popup.geometry("700x700")
+        
+        ttk.Button(threat_intel_frame, text="🔬 Analyze Threat & Reverse Engineer", command=run_deep_intel).pack(pady=5)
         
         # Action buttons
         btn_frame = ttk.Frame(scrollable)
@@ -1987,6 +3133,8 @@ Total Devices: {len(discovered_devices)}
         import queue
         pkt_queue = queue.Queue()
         captured_packets = []  # Store for human-readable inspection
+        total_confidential_found = [0]  # Use list for mutable in closure
+        
         def packet_callback(pkt):
             if IP in pkt:
                 src = pkt[IP].src
@@ -1995,17 +3143,56 @@ Total Devices: {len(discovered_devices)}
                 proto_name = {6: 'TCP', 17: 'UDP'}.get(proto, str(proto))
                 info = ""
                 threat = ""
+                confidential_flag = ""
+                
                 if TCP in pkt:
                     sport, dport = pkt[TCP].sport, pkt[TCP].dport
                     info = f"TCP {sport}->{dport}"
                     if dport in [23, 2323, 4444, 3389]:
                         threat = "Suspicious Port"
+                    # Check for unencrypted protocols that may contain sensitive data
+                    if dport in [80, 8080, 21, 23, 25, 110, 143]:
+                        threat = "Unencrypted" if not threat else threat + " | Unencrypted"
                 elif UDP in pkt:
                     sport, dport = pkt[UDP].sport, pkt[UDP].dport
                     info = f"UDP {sport}->{dport}"
                 else:
                     info = proto_name
-                pkt_queue.put((src, dst, proto_name, info, threat))
+                
+                # Check for confidential data in payload
+                if pkt.haslayer('Raw'):
+                    try:
+                        raw_data = pkt['Raw'].load.decode(errors='replace')
+                        extracted = extract_confidential_data(raw_data)
+                        
+                        # Check if any confidential data found
+                        found_types = []
+                        if extracted['passwords']:
+                            found_types.append('PWD')
+                        if extracted['usernames']:
+                            found_types.append('USER')
+                        if extracted['emails']:
+                            found_types.append('EMAIL')
+                        if extracted['credit_cards']:
+                            found_types.append('CC')
+                        if extracted['api_keys'] or extracted['tokens']:
+                            found_types.append('TOKEN')
+                        if extracted['cookies']:
+                            found_types.append('COOKIE')
+                        if extracted['auth_headers']:
+                            found_types.append('AUTH')
+                        
+                        if found_types:
+                            confidential_flag = " | ".join(found_types)
+                            total_confidential_found[0] += 1
+                            if not threat:
+                                threat = "⚠️ CONFIDENTIAL"
+                            else:
+                                threat += " | CONFID"
+                    except Exception:
+                        pass
+                
+                pkt_queue.put((src, dst, proto_name, info, threat, confidential_flag))
                 captured_packets.insert(0, pkt)
                 if len(captured_packets) > 2000:
                     captured_packets.pop()
@@ -2013,12 +3200,21 @@ Total Devices: {len(discovered_devices)}
         def process_packet_queue():
             try:
                 while True:
-                    src, dst, proto_name, info, threat = pkt_queue.get_nowait()
-                    values = (time.strftime('%H:%M:%S'), src, dst, proto_name, info, threat)
-                    pkt_tree.insert("", 0, values=values)
-                    if threat:
-                        pkt_tree.item(pkt_tree.get_children()[0], tags=('threat',))
-                        pkt_tree.tag_configure('threat', background='#ffcccc')
+                    src, dst, proto_name, info, threat, confidential_flag = pkt_queue.get_nowait()
+                    values = (time.strftime('%H:%M:%S'), src, dst, proto_name, info, threat, confidential_flag)
+                    
+                    # Determine tag based on content
+                    if confidential_flag:
+                        tag = 'confidential'
+                    elif threat:
+                        tag = 'suspicious'
+                    else:
+                        tag = 'clean'
+                    
+                    pkt_tree.insert("", 0, values=values, tags=(tag,))
+                    
+                    # Update confidential count
+                    confidential_count.set(total_confidential_found[0])
             except queue.Empty:
                 pass
             root.after(200, process_packet_queue)
