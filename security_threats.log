@@ -9483,3 +9483,45 @@ Risk Score: 183
 2025-12-15 11:50:27 - SecurityMonitor - INFO - ThreatMonitor initialized
 2025-12-15 11:50:27 - SecurityMonitor - INFO - Starting system monitoring
 2025-12-15 11:51:09 - SecurityMonitor - ERROR - Enhanced network scan failed: name 'get_mac_vendor' is not defined
+2025-12-15 11:56:08 - SecurityMonitor - ERROR - Enhanced network scan failed: name 'get_mac_vendor' is not defined
+2025-12-15 11:56:49 - SecurityMonitor - ERROR - Error getting WiFi passwords: 'NoneType' object has no attribute 'split'
+2025-12-15 12:05:56 - SecurityMonitor - INFO - Application starting
+2025-12-15 12:05:58 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 12:05:58 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 12:05:58 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 12:06:24 - SecurityMonitor - INFO - CA certificate generated at C:\Users\ntoam\.security_monitor\certs\ca.crt
+2025-12-15 12:07:26 - SecurityMonitor - INFO - CA certificate generated at C:\Users\ntoam\.security_monitor\certs\ca.crt
+2025-12-15 12:10:35 - SecurityMonitor - ERROR - Enhanced network scan failed: name 'get_mac_vendor' is not defined
+2025-12-15 12:15:58 - SecurityMonitor - ERROR - Enhanced network scan failed: name 'get_mac_vendor' is not defined
+2025-12-15 12:18:20 - SecurityMonitor - INFO - Application starting
+2025-12-15 12:18:22 - SecurityMonitor - INFO - Loaded threat database from c:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 12:18:22 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 12:18:22 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 12:25:33 - SecurityMonitor - INFO - Application starting
+2025-12-15 12:25:37 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 12:25:37 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 12:25:37 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 12:43:48 - SecurityMonitor - INFO - Application starting
+2025-12-15 12:43:51 - SecurityMonitor - INFO - Loaded threat database from c:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 12:43:51 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 12:43:51 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 12:52:28 - SecurityMonitor - INFO - Application starting
+2025-12-15 12:52:32 - SecurityMonitor - INFO - Loaded threat database from c:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 12:52:32 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 12:52:32 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 13:08:16 - SecurityMonitor - INFO - Application starting
+2025-12-15 13:08:21 - SecurityMonitor - INFO - Loaded threat database from c:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 13:08:21 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 13:08:21 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 13:11:13 - SecurityMonitor - INFO - Application starting
+2025-12-15 13:11:16 - SecurityMonitor - INFO - Loaded threat database from c:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 13:11:16 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 13:11:16 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 13:23:48 - SecurityMonitor - INFO - Application starting
+2025-12-15 13:23:52 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 13:23:52 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 13:23:52 - SecurityMonitor - INFO - Starting system monitoring
+2025-12-15 13:28:08 - SecurityMonitor - INFO - Application starting
+2025-12-15 13:28:11 - SecurityMonitor - INFO - Loaded threat database from C:\Users\ntoam\OneDrive\Projects\Security Threat Intelligance\threat_database.json
+2025-12-15 13:28:11 - SecurityMonitor - INFO - ThreatMonitor initialized
+2025-12-15 13:28:11 - SecurityMonitor - INFO - Starting system monitoring
