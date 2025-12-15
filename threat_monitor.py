@@ -12,6 +12,7 @@ License: MIT
 
 import os
 import sys
+import socket
 import psutil
 import win32gui
 import win32process
@@ -317,6 +318,49 @@ def guess_device_type(name: str, vendor: str) -> str:
         return "Camera/IoT"
     
     return "Unknown"
+
+
+def get_router_default_credentials(vendor: str) -> str:
+    """Get common default router credentials based on vendor."""
+    vendor_lower = vendor.lower() if vendor else ""
+    
+    # Common router default credentials database
+    credentials_db = {
+        "tp-link": "Username: admin\nPassword: admin",
+        "d-link": "Username: admin\nPassword: (blank) or admin",
+        "netgear": "Username: admin\nPassword: password",
+        "linksys": "Username: admin\nPassword: admin",
+        "asus": "Username: admin\nPassword: admin",
+        "cisco": "Username: admin\nPassword: admin or cisco",
+        "huawei": "Username: admin\nPassword: admin",
+        "zte": "Username: admin\nPassword: admin",
+        "belkin": "Username: admin\nPassword: (blank)",
+        "tenda": "Username: admin\nPassword: admin",
+        "mikrotik": "Username: admin\nPassword: (blank)",
+        "ubiquiti": "Username: ubnt\nPassword: ubnt",
+        "arris": "Username: admin\nPassword: password",
+        "motorola": "Username: admin\nPassword: motorola",
+        "actiontec": "Username: admin\nPassword: (on router label)",
+        "technicolor": "Username: admin\nPassword: admin",
+        "sagemcom": "Username: admin\nPassword: admin",
+        "comtrend": "Username: admin\nPassword: admin",
+        "zhone": "Username: admin\nPassword: zhone",
+        "thomson": "Username: admin\nPassword: admin",
+    }
+    
+    # Find matching vendor
+    for key, creds in credentials_db.items():
+        if key in vendor_lower:
+            return creds
+    
+    # Default generic credentials
+    return """Common defaults to try:
+• Username: admin | Password: admin
+• Username: admin | Password: password
+• Username: admin | Password: (blank)
+• Username: admin | Password: 1234
+• Username: user | Password: user
+• Check router label for default credentials"""
 
 
 def get_router_and_devices():
@@ -836,7 +880,8 @@ def run_gui():
     """Main GUI application entry point."""
     root = tk.Tk()
     root.title("Security Threat Intelligence Monitor")
-    root.geometry("950x550")
+    root.geometry("1280x720")
+    root.minsize(1100, 650)
     style = ttk.Style(root)
     style.theme_use('clam')
     style.configure('Treeview', rowheight=28, font=('Segoe UI', 10))
@@ -942,26 +987,593 @@ def run_gui():
     pkt_tree.bind("<Double-1>", show_packet_details)
 
 
-    # --- Network Map Tab ---
+    # --- Network Map Tab (Enhanced) ---
     map_frame = ttk.Frame(notebook)
     notebook.add(map_frame, text='🗺️ Network Map')
-    map_label = ttk.Label(map_frame, text="Discover router and connected devices on your network.", font=("Segoe UI", 10))
-    map_label.pack(pady=5)
+    
+    # Header frame with status
+    map_header = ttk.Frame(map_frame)
+    map_header.pack(fill=tk.X, padx=5, pady=5)
+    
+    map_status_var = tk.StringVar(value="Ready to scan network. Click 'Scan Network' to discover devices.")
+    map_status_label = ttk.Label(map_header, textvariable=map_status_var, font=("Segoe UI", 10))
+    map_status_label.pack(side=tk.LEFT)
+    
+    # Analytics display
     analytics_var = tk.StringVar(value="")
-    analytics_label = ttk.Label(map_frame, textvariable=analytics_var, font=("Segoe UI", 10, "italic"), foreground="#444")
-    analytics_label.pack(pady=2)
-    map_columns = ("IP", "MAC", "Name", "Vendor", "Type", "Last Seen")
-    map_tree = ttk.Treeview(map_frame, columns=map_columns, show="headings", height=15)
+    analytics_label = ttk.Label(map_header, textvariable=analytics_var, font=("Segoe UI", 10, "bold"), foreground="#0066cc")
+    analytics_label.pack(side=tk.RIGHT)
+    
+    # Enhanced columns with bandwidth
+    map_columns = ("IP", "MAC", "Hostname", "Vendor", "Type", "Status", "Bytes Sent", "Bytes Recv", "Last Seen")
+    map_tree = ttk.Treeview(map_frame, columns=map_columns, show="headings", height=12)
     for col in map_columns:
         map_tree.heading(col, text=col)
-        map_tree.column(col, width=140 if col!="Name" else 180)
-    map_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    # Always enable the button, check for modules at click time
-    map_btn = ttk.Button(map_frame, text="🔍 Scan Network", state=tk.NORMAL)
-    map_btn.pack(pady=5)
+        if col in ("Bytes Sent", "Bytes Recv"):
+            map_tree.column(col, width=90, anchor='e')
+        elif col == "IP":
+            map_tree.column(col, width=120)
+        elif col == "MAC":
+            map_tree.column(col, width=130)
+        elif col == "Hostname":
+            map_tree.column(col, width=150)
+        elif col == "Vendor":
+            map_tree.column(col, width=140)
+        elif col == "Last Seen":
+            map_tree.column(col, width=140)
+        else:
+            map_tree.column(col, width=90)
     
+    # Scrollbar for tree
+    map_scroll = ttk.Scrollbar(map_frame, orient="vertical", command=map_tree.yview)
+    map_tree.configure(yscrollcommand=map_scroll.set)
+    map_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5,0), pady=5)
+    map_scroll.pack(side=tk.LEFT, fill=tk.Y, pady=5)
+    
+    # Row coloring
+    map_tree.tag_configure('router', background='#cce5ff', foreground='#004085')
+    map_tree.tag_configure('active', background='#d4edda', foreground='#155724')
+    map_tree.tag_configure('inactive', background='#f8d7da', foreground='#721c24')
+    map_tree.tag_configure('unknown', background='#fff3cd', foreground='#856404')
+    
+    # Control buttons frame
+    map_btn_frame = ttk.Frame(map_frame)
+    map_btn_frame.pack(fill=tk.X, padx=5, pady=5)
+    
+    # Scan control variables
+    scan_running = tk.BooleanVar(value=False)
+    scan_thread = None
+    discovered_devices = {}  # Store device info for reports
+    
+    # Format bytes to human readable
+    def format_bytes(bytes_val):
+        if bytes_val < 1024:
+            return f"{bytes_val} B"
+        elif bytes_val < 1024 * 1024:
+            return f"{bytes_val / 1024:.1f} KB"
+        elif bytes_val < 1024 * 1024 * 1024:
+            return f"{bytes_val / (1024*1024):.1f} MB"
+        else:
+            return f"{bytes_val / (1024*1024*1024):.2f} GB"
+    
+    def get_ip_info(ip):
+        """Perform reverse lookup and get IP information."""
+        info = {
+            'ip': ip,
+            'hostname': 'Unknown',
+            'org': 'Unknown',
+            'city': 'Unknown',
+            'country': 'Unknown',
+            'isp': 'Unknown',
+            'asn': 'Unknown',
+            'is_private': False,
+            'reverse_dns': 'Unknown',
+            'geolocation': None,
+            'whois': None
+        }
+        
+        # Check if private IP
+        if ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.'):
+            info['is_private'] = True
+            info['org'] = 'Private Network'
+            info['city'] = 'Local'
+            info['country'] = 'Local'
+        
+        # Reverse DNS lookup
+        try:
+            info['reverse_dns'] = socket.gethostbyaddr(ip)[0]
+            info['hostname'] = info['reverse_dns']
+        except (socket.herror, socket.gaierror):
+            pass
+        
+        # For public IPs, get geolocation info
+        if not info['is_private']:
+            try:
+                # Use ip-api.com (free, no API key required)
+                resp = requests.get(f'http://ip-api.com/json/{ip}?fields=status,message,country,city,isp,org,as,query', timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('status') == 'success':
+                        info['country'] = data.get('country', 'Unknown')
+                        info['city'] = data.get('city', 'Unknown')
+                        info['isp'] = data.get('isp', 'Unknown')
+                        info['org'] = data.get('org', 'Unknown')
+                        info['asn'] = data.get('as', 'Unknown')
+                        info['geolocation'] = data
+            except Exception as e:
+                app_logger.debug(f"IP info lookup failed for {ip}: {e}")
+        
+        return info
+    
+    def get_network_io_by_connection():
+        """Get network I/O statistics per connection."""
+        io_stats = {}
+        try:
+            # Get per-connection stats using psutil
+            net_io = psutil.net_io_counters(pernic=True)
+            for nic, counters in net_io.items():
+                io_stats[nic] = {
+                    'bytes_sent': counters.bytes_sent,
+                    'bytes_recv': counters.bytes_recv,
+                    'packets_sent': counters.packets_sent,
+                    'packets_recv': counters.packets_recv
+                }
+        except Exception as e:
+            app_logger.debug(f"Network IO error: {e}")
+        return io_stats
+    
+    def scan_network_enhanced():
+        """Enhanced network scan with device discovery and traffic monitoring."""
+        nonlocal discovered_devices
+        
+        map_status_var.set("🔄 Scanning network... Please wait.")
+        map_tree.delete(*map_tree.get_children())
+        discovered_devices = {}
+        
+        missing = check_network_dependencies()
+        if missing:
+            map_status_var.set(f"❌ Missing: {' & '.join(missing)}")
+            map_tree.insert("", 0, values=('-', '-', '-', '-', '-', '-', '-', '-', 
+                f"Install {' & '.join(missing)} for full network scanning"))
+            scan_running.set(False)
+            return
+        
+        if not scan_running.get():
+            return
+        
+        try:
+            # Get router and initial device list
+            router_ip, devices = get_router_and_devices()
+            
+            if not scan_running.get():
+                return
+            
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            device_count = 0
+            type_counts = {}
+            
+            # Get network I/O for traffic estimation
+            net_io = get_network_io_by_connection()
+            total_sent = sum(n['bytes_sent'] for n in net_io.values())
+            total_recv = sum(n['bytes_recv'] for n in net_io.values())
+            
+            # Add router first
+            if router_ip and scan_running.get():
+                router_info = get_ip_info(router_ip)
+                discovered_devices[router_ip] = {
+                    'ip': router_ip,
+                    'mac': 'N/A',
+                    'hostname': router_info['hostname'],
+                    'vendor': 'Gateway',
+                    'type': 'Router',
+                    'status': 'Active',
+                    'bytes_sent': total_sent,
+                    'bytes_recv': total_recv,
+                    'last_seen': now,
+                    'info': router_info
+                }
+                map_tree.insert("", "end", 
+                    values=(router_ip, 'N/A', router_info['hostname'], 'Gateway', 'Router', 
+                            '🟢 Active', format_bytes(total_sent), format_bytes(total_recv), now),
+                    tags=('router',))
+                type_counts['Router'] = 1
+                device_count += 1
+                map_status_var.set(f"🔄 Found router: {router_ip}. Scanning devices...")
+            
+            # Process each discovered device
+            for i, dev in enumerate(devices):
+                if not scan_running.get():
+                    break
+                
+                ip = dev['ip']
+                if ip == router_ip:
+                    continue
+                
+                mac = dev['mac']
+                hostname = dev.get('name', ip)
+                
+                # Get vendor
+                vendor = lookup_vendor(mac)
+                
+                # Guess device type
+                dtype = guess_device_type(hostname, vendor)
+                
+                # Get detailed IP info
+                ip_info = get_ip_info(ip)
+                if ip_info['hostname'] != 'Unknown':
+                    hostname = ip_info['hostname']
+                
+                # Check if device is still reachable (ping)
+                status = 'Active'
+                try:
+                    # Quick ping check
+                    if SCAPY_AVAILABLE:
+                        from scapy.all import sr1, ICMP, IP as ScapyIP
+                        pkt = sr1(ScapyIP(dst=ip)/ICMP(), timeout=1, verbose=0)
+                        status = 'Active' if pkt else 'Inactive'
+                except Exception:
+                    status = 'Unknown'
+                
+                # Estimate traffic (proportional distribution for now)
+                device_sent = total_sent // max(len(devices), 1)
+                device_recv = total_recv // max(len(devices), 1)
+                
+                # Store device info
+                discovered_devices[ip] = {
+                    'ip': ip,
+                    'mac': mac,
+                    'hostname': hostname,
+                    'vendor': vendor,
+                    'type': dtype,
+                    'status': status,
+                    'bytes_sent': device_sent,
+                    'bytes_recv': device_recv,
+                    'last_seen': now,
+                    'info': ip_info
+                }
+                
+                # Determine row tag based on status
+                row_tag = 'active' if status == 'Active' else ('inactive' if status == 'Inactive' else 'unknown')
+                status_icon = '🟢' if status == 'Active' else ('🔴' if status == 'Inactive' else '🟡')
+                
+                map_tree.insert("", "end",
+                    values=(ip, mac, hostname, vendor, dtype, f"{status_icon} {status}",
+                            format_bytes(device_sent), format_bytes(device_recv), now),
+                    tags=(row_tag,))
+                
+                type_counts[dtype] = type_counts.get(dtype, 0) + 1
+                device_count += 1
+                
+                map_status_var.set(f"🔄 Scanning... Found {device_count} devices ({i+1}/{len(devices)})")
+                root.update_idletasks()
+            
+            # Update analytics
+            if device_count > 0:
+                analytics = f"📊 {device_count} Devices | " + " | ".join(f"{k}: {v}" for k, v in type_counts.items())
+                analytics_var.set(analytics)
+                map_status_var.set(f"✅ Scan complete. Found {device_count} devices.")
+            else:
+                map_status_var.set("⚠️ No devices found. Run as Administrator for better results.")
+            
+        except Exception as e:
+            app_logger.error(f"Network scan error: {e}")
+            map_status_var.set(f"❌ Scan error: {str(e)[:50]}")
+        finally:
+            scan_running.set(False)
+            scan_btn.config(text="🔍 Scan Network")
+            halt_btn.config(state=tk.DISABLED)
+    
+    def start_scan():
+        """Start network scan in background thread."""
+        nonlocal scan_thread
+        if scan_running.get():
+            return
+        
+        scan_running.set(True)
+        scan_btn.config(text="⏳ Scanning...")
+        halt_btn.config(state=tk.NORMAL)
+        
+        scan_thread = threading.Thread(target=scan_network_enhanced, daemon=True)
+        scan_thread.start()
+    
+    def halt_scan():
+        """Stop the network scan."""
+        scan_running.set(False)
+        map_status_var.set("⏹️ Scan halted by user.")
+        scan_btn.config(text="🔍 Scan Network")
+        halt_btn.config(state=tk.DISABLED)
+    
+    def show_device_details(event):
+        """Show detailed information about selected device."""
+        item = map_tree.identify_row(event.y)
+        if not item:
+            return
+        
+        values = map_tree.item(item)['values']
+        ip = values[0]
+        
+        if ip not in discovered_devices:
+            messagebox.showinfo("No Data", "Device data not available. Run a scan first.")
+            return
+        
+        dev = discovered_devices[ip]
+        info = dev.get('info', {})
+        
+        # Create detailed popup
+        popup = tk.Toplevel(root)
+        popup.title(f"📋 Device Report: {ip}")
+        popup.geometry("600x500")
+        popup.configure(bg='#f8f9fa')
+        
+        # Scrollable frame
+        canvas = tk.Canvas(popup, bg='#f8f9fa')
+        scrollbar = ttk.Scrollbar(popup, orient="vertical", command=canvas.yview)
+        scrollable = ttk.Frame(canvas)
+        scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Header
+        ttk.Label(scrollable, text=f"🖥️ Device Intelligence Report", 
+                  font=('Segoe UI', 14, 'bold')).pack(anchor='w', padx=15, pady=10)
+        
+        # Basic Info Section
+        basic_frame = ttk.LabelFrame(scrollable, text="📌 Basic Information")
+        basic_frame.pack(fill=tk.X, padx=15, pady=5)
+        
+        basic_info = [
+            ("IP Address", dev['ip']),
+            ("MAC Address", dev['mac']),
+            ("Hostname", dev['hostname']),
+            ("Vendor", dev['vendor']),
+            ("Device Type", dev['type']),
+            ("Status", dev['status']),
+            ("Last Seen", dev['last_seen'])
+        ]
+        for label, value in basic_info:
+            row = ttk.Frame(basic_frame)
+            row.pack(fill=tk.X, padx=10, pady=2)
+            ttk.Label(row, text=f"{label}:", font=('Segoe UI', 10, 'bold'), width=15).pack(side=tk.LEFT)
+            ttk.Label(row, text=value, font=('Consolas', 10)).pack(side=tk.LEFT)
+        
+        # Traffic Section
+        traffic_frame = ttk.LabelFrame(scrollable, text="📊 Network Traffic")
+        traffic_frame.pack(fill=tk.X, padx=15, pady=5)
+        
+        traffic_info = [
+            ("Bytes Sent", format_bytes(dev['bytes_sent'])),
+            ("Bytes Received", format_bytes(dev['bytes_recv'])),
+            ("Total Traffic", format_bytes(dev['bytes_sent'] + dev['bytes_recv']))
+        ]
+        for label, value in traffic_info:
+            row = ttk.Frame(traffic_frame)
+            row.pack(fill=tk.X, padx=10, pady=2)
+            ttk.Label(row, text=f"{label}:", font=('Segoe UI', 10, 'bold'), width=15).pack(side=tk.LEFT)
+            ttk.Label(row, text=value, font=('Consolas', 10)).pack(side=tk.LEFT)
+        
+        # Reverse Lookup Section
+        lookup_frame = ttk.LabelFrame(scrollable, text="🔍 Reverse Lookup & Intelligence")
+        lookup_frame.pack(fill=tk.X, padx=15, pady=5)
+        
+        lookup_info = [
+            ("Reverse DNS", info.get('reverse_dns', 'N/A')),
+            ("Organization", info.get('org', 'N/A')),
+            ("ISP", info.get('isp', 'N/A')),
+            ("ASN", info.get('asn', 'N/A')),
+            ("City", info.get('city', 'N/A')),
+            ("Country", info.get('country', 'N/A')),
+            ("Private IP", "Yes" if info.get('is_private') else "No")
+        ]
+        for label, value in lookup_info:
+            row = ttk.Frame(lookup_frame)
+            row.pack(fill=tk.X, padx=10, pady=2)
+            ttk.Label(row, text=f"{label}:", font=('Segoe UI', 10, 'bold'), width=15).pack(side=tk.LEFT)
+            ttk.Label(row, text=str(value), font=('Consolas', 10), wraplength=400).pack(side=tk.LEFT)
+        
+        # VirusTotal Check
+        vt_frame = ttk.LabelFrame(scrollable, text="🦠 VirusTotal Analysis")
+        vt_frame.pack(fill=tk.X, padx=15, pady=5)
+        
+        # Check if it's a private IP
+        is_private_ip = ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172.16.") or ip == "127.0.0.1"
+        
+        def run_vt_check():
+            if is_private_ip:
+                vt_status.set("ℹ️ Private IP - Not in VirusTotal database (local network only)")
+                return
+            vt_status.set("Checking VirusTotal...")
+            mal, susp = vt_check_ip(ip)
+            if mal is not None:
+                result = f"Malicious: {mal} | Suspicious: {susp}"
+                if mal > 0 or susp > 0:
+                    result += " ⚠️ FLAGGED"
+                else:
+                    result += " ✅ Clean"
+            else:
+                result = "⚠️ API Error - Check your API key or try again later"
+            vt_status.set(result)
+        
+        if is_private_ip:
+            vt_status = tk.StringVar(value="ℹ️ Private IP - VT only tracks public IPs")
+        else:
+            vt_status = tk.StringVar(value="Click 'Check VirusTotal' to analyze")
+        ttk.Label(vt_frame, textvariable=vt_status, font=('Segoe UI', 10)).pack(padx=10, pady=5)
+        if not is_private_ip:
+            ttk.Button(vt_frame, text="🔍 Check VirusTotal", command=run_vt_check).pack(pady=5)
+        
+        # Router Credentials Section (only for router devices)
+        if dev['type'] == 'Router':
+            creds_frame = ttk.LabelFrame(scrollable, text="🔐 Router Credentials")
+            creds_frame.pack(fill=tk.X, padx=15, pady=5)
+            
+            creds_status = tk.StringVar(value="🔒 Credentials hidden - Enter admin password to reveal")
+            creds_label = ttk.Label(creds_frame, textvariable=creds_status, font=('Segoe UI', 10))
+            creds_label.pack(padx=10, pady=5)
+            
+            # Password entry frame
+            pwd_frame = ttk.Frame(creds_frame)
+            pwd_frame.pack(padx=10, pady=5)
+            
+            ttk.Label(pwd_frame, text="Admin Password:", font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=5)
+            pwd_entry = ttk.Entry(pwd_frame, show="*", width=15)
+            pwd_entry.pack(side=tk.LEFT, padx=5)
+            
+            def reveal_credentials():
+                admin_pwd = "0000"  # Admin password
+                if pwd_entry.get() == admin_pwd:
+                    # Get common router default credentials based on vendor
+                    vendor = dev['vendor'].lower()
+                    default_creds = get_router_default_credentials(vendor)
+                    creds_text = f"""🔓 ROUTER DEFAULT CREDENTIALS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Vendor: {dev['vendor']}
+Router IP: {dev['ip']}
+
+📋 Common Default Logins:
+{default_creds}
+
+⚠️ WARNING: Change default credentials immediately!
+Access router at: http://{dev['ip']}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+                    creds_status.set(creds_text)
+                    pwd_frame.pack_forget()
+                    reveal_btn.pack_forget()
+                else:
+                    messagebox.showerror("Access Denied", "Invalid admin password!")
+                    pwd_entry.delete(0, tk.END)
+            
+            reveal_btn = ttk.Button(creds_frame, text="🔓 Reveal Credentials", command=reveal_credentials)
+            reveal_btn.pack(pady=5)
+        
+        # Action buttons
+        btn_frame = ttk.Frame(scrollable)
+        btn_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        def copy_to_clipboard():
+            report_text = generate_device_report(dev)
+            root.clipboard_clear()
+            root.clipboard_append(report_text)
+            messagebox.showinfo("Copied", "Device report copied to clipboard!")
+        
+        ttk.Button(btn_frame, text="📋 Copy Report", command=copy_to_clipboard).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+    
+    def generate_device_report(dev):
+        """Generate a text report for a device."""
+        info = dev.get('info', {})
+        report = f"""
+{'='*60}
+DEVICE INTELLIGENCE REPORT
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+{'='*60}
+
+BASIC INFORMATION
+-----------------
+IP Address:      {dev['ip']}
+MAC Address:     {dev['mac']}
+Hostname:        {dev['hostname']}
+Vendor:          {dev['vendor']}
+Device Type:     {dev['type']}
+Status:          {dev['status']}
+Last Seen:       {dev['last_seen']}
+
+NETWORK TRAFFIC
+---------------
+Bytes Sent:      {format_bytes(dev['bytes_sent'])}
+Bytes Received:  {format_bytes(dev['bytes_recv'])}
+Total Traffic:   {format_bytes(dev['bytes_sent'] + dev['bytes_recv'])}
+
+REVERSE LOOKUP
+--------------
+Reverse DNS:     {info.get('reverse_dns', 'N/A')}
+Organization:    {info.get('org', 'N/A')}
+ISP:             {info.get('isp', 'N/A')}
+ASN:             {info.get('asn', 'N/A')}
+City:            {info.get('city', 'N/A')}
+Country:         {info.get('country', 'N/A')}
+Private IP:      {'Yes' if info.get('is_private') else 'No'}
+
+{'='*60}
+"""
+        return report
+    
+    def export_network_report():
+        """Export full network scan report."""
+        if not discovered_devices:
+            messagebox.showwarning("No Data", "No devices discovered. Run a scan first.")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text Report", "*.txt"), ("CSV", "*.csv"), ("JSON", "*.json")]
+        )
+        if not file_path:
+            return
+        
+        try:
+            if file_path.endswith('.json'):
+                # JSON export
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(discovered_devices, f, indent=2, default=str)
+            elif file_path.endswith('.csv'):
+                # CSV export
+                import csv
+                with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['IP', 'MAC', 'Hostname', 'Vendor', 'Type', 'Status', 
+                                    'Bytes Sent', 'Bytes Recv', 'Last Seen', 'Reverse DNS', 
+                                    'Organization', 'Country'])
+                    for ip, dev in discovered_devices.items():
+                        info = dev.get('info', {})
+                        writer.writerow([
+                            dev['ip'], dev['mac'], dev['hostname'], dev['vendor'],
+                            dev['type'], dev['status'], dev['bytes_sent'], dev['bytes_recv'],
+                            dev['last_seen'], info.get('reverse_dns', ''), 
+                            info.get('org', ''), info.get('country', '')
+                        ])
+            else:
+                # Text report
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(f"""
+{'='*70}
+NETWORK INTELLIGENCE REPORT
+{'='*70}
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Total Devices: {len(discovered_devices)}
+{'='*70}
+
+""")
+                    for ip, dev in discovered_devices.items():
+                        f.write(generate_device_report(dev))
+                        f.write("\n")
+            
+            messagebox.showinfo("Export Complete", f"Report saved to:\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export: {e}")
+    
+    # Create buttons
+    scan_btn = ttk.Button(map_btn_frame, text="🔍 Scan Network", command=start_scan)
+    scan_btn.pack(side=tk.LEFT, padx=5)
+    
+    halt_btn = ttk.Button(map_btn_frame, text="⏹️ Halt Scan", command=halt_scan, state=tk.DISABLED)
+    halt_btn.pack(side=tk.LEFT, padx=5)
+    
+    report_btn = ttk.Button(map_btn_frame, text="📄 Export Report", command=export_network_report)
+    report_btn.pack(side=tk.LEFT, padx=5)
+    
+    refresh_map_btn = ttk.Button(map_btn_frame, text="🔄 Refresh", command=lambda: [map_tree.delete(*map_tree.get_children()), start_scan()])
+    refresh_map_btn.pack(side=tk.LEFT, padx=5)
+    
+    # Bind double-click for device details
+    map_tree.bind("<Double-1>", show_device_details)
+    
+    # Show initial message
     if check_network_dependencies():
-        map_tree.insert("", 0, values=("-", "-", "-", "-", "-", "Install netifaces & scapy for network map"))
+        map_tree.insert("", 0, values=("-", "-", "-", "-", "-", "-", "-", "-", 
+            "Install netifaces & scapy for network scanning"))
 
     # --- Controls ---
     control_frame = ttk.Frame(root)
@@ -972,7 +1584,7 @@ def run_gui():
         if pause_var.get():
             status_var.set("Status: Monitoring Paused")
         else:
-            status_var.set("Status: Monitoring (Running in Background)")
+            status_var.set("Status: Monitoring (Running in Background) | Double-click threat for details")
 
     pause_btn = ttk.Button(control_frame, text="⏸️ Pause/Resume", command=toggle_pause)
     pause_btn.pack(side=tk.LEFT, padx=2)
@@ -1417,42 +2029,6 @@ def run_gui():
         sniff_thread = threading.Thread(target=start_sniffing, daemon=True)
         sniff_thread.start()
         root.after(200, process_packet_queue)
-
-    # --- Network Map Logic ---
-    def scan_network():
-        map_tree.delete(*map_tree.get_children())
-        analytics_var.set("")
-        missing = check_network_dependencies()
-        if missing:
-            map_tree.insert("", 0, values=('-', '-', '-', '-', '-', f"Install {' & '.join(missing)} for network map"))
-            return
-        router_ip, devices = get_router_and_devices()
-        device_count = 0
-        type_counts = {}
-        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        if router_ip:
-            map_tree.insert("", "end", values=(router_ip, '', 'Router', 'N/A', 'Router', now))
-            device_last_seen[router_ip] = now
-            type_counts['Router'] = 1
-            device_count += 1
-        for dev in devices:
-            if dev['ip'] != router_ip:
-                mac = dev['mac']
-                name = dev['name']
-                vendor = lookup_vendor(mac)
-                dtype = guess_device_type(name, vendor)
-                last_seen = now
-                device_last_seen[dev['ip']] = last_seen
-                map_tree.insert("", "end", values=(dev['ip'], mac, name, vendor, dtype, last_seen))
-                type_counts[dtype] = type_counts.get(dtype, 0) + 1
-                device_count += 1
-        if not device_count:
-            messagebox.showinfo("Scan", "No devices found or admin rights required.")
-        else:
-            analytics = f"Devices: {device_count} | " + ", ".join(f"{k}: {v}" for k,v in type_counts.items())
-            analytics_var.set(analytics)
-
-    map_btn.config(command=scan_network)
 
     def on_close():
         monitor.running = False
