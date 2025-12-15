@@ -1,3 +1,15 @@
+"""
+Security Threat Intelligence Monitor
+=====================================
+
+A real-time Windows process and network monitoring application for detecting
+and responding to potential security threats.
+
+Author: Security Threat Intelligence Team
+Version: 2.0.0
+License: MIT
+"""
+
 import os
 import sys
 import psutil
@@ -8,15 +20,22 @@ import win32api
 import wmi
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from colorama import init, Fore, Style
-import pandas as pd
 import json
 import hashlib
 import requests
-import datetime
-
 import threading
+import queue
+import ctypes
+import subprocess
+from pathlib import Path
+from typing import Optional, Dict, Any, Callable, List, Tuple
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from tkinter import filedialog
 
 # Optional imports for network features
 SCAPY_AVAILABLE = False
@@ -32,94 +51,373 @@ try:
 except ImportError:
     pass
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-from tkinter import filedialog
-
 # Initialize colorama for colored output (for console fallback)
 init()
 
-VIRUSTOTAL_API_KEY = "0e5e3afe6dd5dd1c4b3b4207a869dec462ebe73ef997b06f67617dabee82acf9"
-VIRUSTOTAL_FILE_URL = "https://www.virustotal.com/api/v3/files/{}"
-VIRUSTOTAL_IP_URL = "https://www.virustotal.com/api/v3/ip_addresses/{}"
+# =============================================================================
+# CONFIGURATION - Load from environment variables for production security
+# =============================================================================
 
-# --- VirusTotal helpers ---
-def vt_get_file_hash(filepath):
+def _load_env_file():
+    """Load environment variables from .env file if present."""
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        try:
+            with open(env_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ.setdefault(key.strip(), value.strip())
+        except Exception:
+            pass
+
+_load_env_file()
+
+
+class Config:
+    """Application configuration loaded from environment variables."""
+    
+    # VirusTotal API Configuration - NEVER hardcode API keys in production!
+    VIRUSTOTAL_API_KEY: Optional[str] = os.getenv('VIRUSTOTAL_API_KEY')
+    VIRUSTOTAL_FILE_URL: str = "https://www.virustotal.com/api/v3/files/{}"
+    VIRUSTOTAL_IP_URL: str = "https://www.virustotal.com/api/v3/ip_addresses/{}"
+    
+    # Logging Configuration
+    LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
+    LOG_FILE: str = os.getenv('LOG_FILE', 'security_threats.log')
+    LOG_MAX_SIZE_MB: int = int(os.getenv('LOG_MAX_SIZE_MB', '10'))
+    LOG_BACKUP_COUNT: int = int(os.getenv('LOG_BACKUP_COUNT', '5'))
+    
+    # Monitoring Configuration
+    SCAN_INTERVAL_SECONDS: int = int(os.getenv('SCAN_INTERVAL_SECONDS', '1'))
+    RISK_THRESHOLD_WARNING: int = int(os.getenv('RISK_THRESHOLD_WARNING', '3'))
+    RISK_THRESHOLD_CRITICAL: int = int(os.getenv('RISK_THRESHOLD_CRITICAL', '5'))
+    PROCESS_CACHE_TTL_SECONDS: int = int(os.getenv('PROCESS_CACHE_TTL_SECONDS', '60'))
+    
+    # Network Monitoring
+    ENABLE_PACKET_CAPTURE: bool = os.getenv('ENABLE_PACKET_CAPTURE', 'true').lower() == 'true'
+    PACKET_BUFFER_SIZE: int = int(os.getenv('PACKET_BUFFER_SIZE', '2000'))
+    
+    # Paths
+    BASE_DIR: Path = Path(__file__).parent
+    THREAT_DATABASE_PATH: Path = BASE_DIR / 'threat_database.json'
+    
+    @classmethod
+    def validate(cls) -> List[str]:
+        """Validate configuration and return list of warnings."""
+        warnings = []
+        if not cls.VIRUSTOTAL_API_KEY:
+            warnings.append(
+                "VIRUSTOTAL_API_KEY not set. VirusTotal integration disabled. "
+                "Set it in .env file or environment variables."
+            )
+        elif cls.VIRUSTOTAL_API_KEY == 'your_api_key_here':
+            warnings.append(
+                "VIRUSTOTAL_API_KEY is still set to placeholder. "
+                "Please update with your actual API key."
+            )
+            cls.VIRUSTOTAL_API_KEY = None
+        return warnings
+    
+    @classmethod
+    def get_log_level(cls) -> int:
+        """Convert string log level to logging constant."""
+        levels = {
+            'DEBUG': logging.DEBUG,
+            'INFO': logging.INFO,
+            'WARNING': logging.WARNING,
+            'ERROR': logging.ERROR,
+            'CRITICAL': logging.CRITICAL
+        }
+        return levels.get(cls.LOG_LEVEL.upper(), logging.INFO)
+
+
+# Validate configuration on startup
+_config_warnings = Config.validate()
+for warning in _config_warnings:
+    print(f"{Fore.YELLOW}[CONFIG WARNING] {warning}{Style.RESET_ALL}")
+
+
+# =============================================================================
+# LOGGING SETUP - Production-ready with rotation
+# =============================================================================
+
+def setup_logging() -> logging.Logger:
+    """Configure logging with file rotation and console output."""
+    formatter = logging.Formatter(
+        fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    logger = logging.getLogger('SecurityMonitor')
+    logger.setLevel(Config.get_log_level())
+    logger.handlers.clear()
+    
+    # File handler with rotation
+    log_path = Config.BASE_DIR / Config.LOG_FILE
+    file_handler = RotatingFileHandler(
+        filename=log_path,
+        maxBytes=Config.LOG_MAX_SIZE_MB * 1024 * 1024,
+        backupCount=Config.LOG_BACKUP_COUNT,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(Config.get_log_level())
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+
+# Initialize logger
+app_logger = setup_logging()
+
+
+# =============================================================================
+# ADMIN UTILITIES
+# =============================================================================
+
+def is_admin() -> bool:
+    """Check if the current process has administrator privileges."""
     try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except (AttributeError, OSError):
+        return False
+
+
+def add_firewall_rule(name: str, direction: str = "out", remote_ip: Optional[str] = None,
+                      program: Optional[str] = None, action: str = "block") -> bool:
+    """Add a Windows Firewall rule using netsh."""
+    if not is_admin():
+        app_logger.error("Firewall modification requires administrator privileges")
+        return False
+    
+    cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
+           f"name={name}", f"dir={direction}", f"action={action}"]
+    
+    if remote_ip:
+        cmd.append(f"remoteip={remote_ip}")
+    if program:
+        cmd.append(f"program={program}")
+    
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        app_logger.info(f"Firewall rule '{name}' created successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        app_logger.error(f"Failed to create firewall rule: {e.stderr}")
+        return False
+
+
+# =============================================================================
+# VIRUSTOTAL API - Secure implementation
+# =============================================================================
+
+def vt_get_file_hash(filepath: str) -> Optional[str]:
+    """Calculate SHA256 hash of a file."""
+    try:
+        sha256_hash = hashlib.sha256()
         with open(filepath, "rb") as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()
-        return file_hash
-    except Exception:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(chunk)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        app_logger.error(f"Error hashing file {filepath}: {e}")
         return None
 
-def vt_check_file(hash):
+
+def vt_check_file(file_hash: str) -> Tuple[Optional[int], Optional[int]]:
+    """Check a file hash against VirusTotal database."""
+    if not Config.VIRUSTOTAL_API_KEY:
+        return None, None
+    
     try:
-        headers = {"x-apikey": VIRUSTOTAL_API_KEY}
-        url = VIRUSTOTAL_FILE_URL.format(hash)
+        headers = {"x-apikey": Config.VIRUSTOTAL_API_KEY}
+        url = Config.VIRUSTOTAL_FILE_URL.format(file_hash)
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             stats = data["data"]["attributes"]["last_analysis_stats"]
-            malicious = stats.get("malicious", 0)
-            suspicious = stats.get("suspicious", 0)
-            return malicious, suspicious
-        else:
-            return None, None
-    except Exception:
+            return stats.get("malicious", 0), stats.get("suspicious", 0)
+        return None, None
+    except Exception as e:
+        app_logger.error(f"VirusTotal API error: {e}")
         return None, None
 
-def vt_check_ip(ip):
+
+def vt_check_ip(ip: str) -> Tuple[Optional[int], Optional[int]]:
+    """Check an IP address against VirusTotal database."""
+    if not Config.VIRUSTOTAL_API_KEY:
+        return None, None
+    
+    # Skip local/private IPs
+    if ip in ("0.0.0.0", "127.0.0.1") or ip.startswith("192.168.") or ip.startswith("10."):
+        return None, None
+    
     try:
-        headers = {"x-apikey": VIRUSTOTAL_API_KEY}
-        url = VIRUSTOTAL_IP_URL.format(ip)
+        headers = {"x-apikey": Config.VIRUSTOTAL_API_KEY}
+        url = Config.VIRUSTOTAL_IP_URL.format(ip)
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             stats = data["data"]["attributes"]["last_analysis_stats"]
-            malicious = stats.get("malicious", 0)
-            suspicious = stats.get("suspicious", 0)
-            return malicious, suspicious
-        else:
-            return None, None
-    except Exception:
+            return stats.get("malicious", 0), stats.get("suspicious", 0)
         return None, None
+    except Exception as e:
+        app_logger.error(f"VirusTotal API error for IP {ip}: {e}")
+        return None, None
+
+# =============================================================================
+# NETWORK UTILITIES
+# =============================================================================
+
+def check_network_dependencies() -> List[str]:
+    """Check which network dependencies are missing."""
+    missing = []
+    if not SCAPY_AVAILABLE:
+        missing.append('scapy')
+    if not NETIFACES_AVAILABLE:
+        missing.append('netifaces')
+    return missing
+
+
+def lookup_vendor(mac: str) -> str:
+    """Look up MAC address vendor using online API."""
+    try:
+        resp = requests.get(f'https://api.macvendors.com/{mac}', timeout=2)
+        if resp.status_code == 200:
+            return resp.text
+    except requests.RequestException:
+        pass
+    return "Unknown"
+
+
+def guess_device_type(name: str, vendor: str) -> str:
+    """Guess device type based on hostname and vendor."""
+    name_lower = name.lower()
+    vendor_lower = vendor.lower()
+    
+    if any(x in name_lower for x in ["router", "gateway", "modem"]):
+        return "Router"
+    
+    pc_vendors = ["intel", "realtek", "broadcom", "atheros", "microsoft", "dell", "hp", "lenovo"]
+    if any(x in vendor_lower for x in pc_vendors):
+        return "PC/Workstation"
+    
+    mobile_vendors = ["apple", "samsung", "android", "huawei", "xiaomi", "oneplus", "oppo"]
+    if any(x in vendor_lower for x in mobile_vendors):
+        return "Mobile Device"
+    
+    printer_vendors = ["printer", "hp inc", "canon", "epson", "brother", "lexmark"]
+    if any(x in vendor_lower for x in printer_vendors):
+        return "Printer"
+    
+    camera_vendors = ["camera", "hikvision", "dahua", "axis", "nest", "ring"]
+    if any(x in vendor_lower for x in camera_vendors):
+        return "Camera/IoT"
+    
+    return "Unknown"
+
+
+def get_router_and_devices():
+    """Discover router IP and connected network devices using ARP scan."""
+    if not (NETIFACES_AVAILABLE and SCAPY_AVAILABLE):
+        return None, []
+    
+    try:
+        gateways = netifaces.gateways()
+        router_ip = gateways.get('default', {}).get(netifaces.AF_INET, [None])[0]
+        devices = []
+        
+        if router_ip:
+            ip_range = router_ip.rsplit('.', 1)[0] + '.1/24'
+            try:
+                ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip_range), timeout=2, verbose=0)
+                for snd, rcv in ans:
+                    ip = rcv.psrc
+                    mac = rcv.hwsrc
+                    try:
+                        import socket
+                        name = socket.gethostbyaddr(ip)[0]
+                    except Exception:
+                        name = ip
+                    devices.append({'ip': ip, 'mac': mac, 'name': name})
+            except PermissionError:
+                app_logger.error("Network scan requires administrator privileges")
+            except Exception as e:
+                app_logger.error(f"ARP scan failed: {e}")
+                
+        return router_ip, devices
+    except Exception as e:
+        app_logger.error(f"Network discovery failed: {e}")
+        return None, []
+
+
+# Store device last seen times
+device_last_seen: Dict[str, str] = {}
+
+
+# =============================================================================
+# THREAT DATABASE
+# =============================================================================
+
+class ThreatDatabase:
+    """Manages the threat indicator database."""
+    
+    DEFAULT_DATABASE = {
+        "suspicious_paths": [
+            "\\temp\\", "\\downloads\\", "\\appdata\\local\\temp\\",
+            "\\programdata\\", "\\windows\\temp\\"
+        ],
+        "suspicious_connections": ["0.0.0.0", "127.0.0.1"],
+        "high_risk_processes": [
+            "cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe",
+            "regsvr32.exe", "mshta.exe", "rundll32.exe"
+        ]
+    }
+    
+    def __init__(self, database_path: Optional[Path] = None):
+        self.database_path = database_path or Config.THREAT_DATABASE_PATH
+        self.data = self._load()
+        
+    def _load(self) -> Dict[str, List[str]]:
+        """Load threat database from file or use defaults."""
+        try:
+            if self.database_path.exists():
+                with open(self.database_path, 'r') as f:
+                    data = json.load(f)
+                    app_logger.info(f"Loaded threat database from {self.database_path}")
+                    return data
+        except (json.JSONDecodeError, IOError) as e:
+            app_logger.warning(f"Error loading threat database: {e}")
+        
+        app_logger.info("Using default threat database")
+        return self.DEFAULT_DATABASE.copy()
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.data.get(key, default)
+    
+    def __getitem__(self, key: str) -> Any:
+        return self.data[key]
+
+
+# =============================================================================
+# THREAT MONITOR ENGINE
+# =============================================================================
 
 class ThreatMonitor:
-    def __init__(self, gui_callback=None):
+    """Main threat monitoring engine."""
+    
+    def __init__(self, gui_callback: Optional[Callable] = None):
         self.wmi = wmi.WMI()
-        self.known_processes = {}
-        self.threat_database = self.load_threat_database()
-        self.setup_logging()
-        self.gui_callback = gui_callback  # Function to call when a threat is detected
+        self.known_processes: Dict[int, Dict] = {}
+        self.threat_database = ThreatDatabase()
+        self.gui_callback = gui_callback
         self.running = True
-        
-    def setup_logging(self):
-        logging.basicConfig(
-            filename='security_threats.log',
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
+        app_logger.info("ThreatMonitor initialized")
 
-    def load_threat_database(self):
-        try:
-            with open('threat_database.json', 'r') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            # Return default threat indicators if database doesn't exist
-            return {
-                "suspicious_paths": [
-                    "\\temp\\", "\\downloads\\",
-                    "\\appdata\\local\\temp\\"
-                ],
-                "suspicious_connections": [
-                    "0.0.0.0", "127.0.0.1"
-                ],
-                "high_risk_processes": [
-                    "cmd.exe", "powershell.exe"
-                ]
-            }
-
-    def get_process_details(self, pid):
+    def get_process_details(self, pid: int) -> Optional[Dict[str, Any]]:
+        """Get detailed information about a process."""
         try:
             process = psutil.Process(pid)
             return {
@@ -130,179 +428,412 @@ class ThreatMonitor:
                 'cpu_percent': process.cpu_percent(),
                 'memory_percent': process.memory_percent(),
                 'connections': process.net_connections(),
-                'create_time': datetime.fromtimestamp(process.create_time()).strftime('%Y-%m-%d %H:%M:%S')
+                'create_time': datetime.fromtimestamp(
+                    process.create_time()
+                ).strftime('%Y-%m-%d %H:%M:%S')
             }
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return None
+        except Exception as e:
+            app_logger.debug(f"Error getting process details for PID {pid}: {e}")
+            return None
 
-    def analyze_process(self, process_details):
+    def analyze_process(self, process_details: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """
+        Analyze a process for potential threats with detailed breakdown.
+        
+        Returns:
+            Tuple of (risk_score, threat_breakdown) where threat_breakdown contains
+            detailed information about each detected threat indicator.
+        """
         if not process_details:
-            return 0
+            return 0, {}
         
         risk_score = 0
+        threat_breakdown = {
+            'categories': [],           # List of threat category names
+            'indicators': [],            # Detailed indicator descriptions
+            'severity': 'Safe',          # Overall severity: Safe, Low, Medium, High, Critical
+            'recommendations': [],       # Suggested actions
+            'vt_file': None,            # VirusTotal file analysis
+            'vt_ips': [],               # VirusTotal IP analysis results
+            'suspicious_connections': [], # List of suspicious network connections
+            'resource_abuse': [],        # Resource abuse indicators
+            'details': {}               # Raw details for advanced view
+        }
         
-        # Check suspicious paths
-        exe_path = process_details['exe'].lower()
-        for sus_path in self.threat_database['suspicious_paths']:
-            if sus_path in exe_path:
+        exe_path = process_details.get('exe', '').lower()
+        process_name = process_details.get('name', '').lower()
+        
+        # =================================================================
+        # 1. SUSPICIOUS PATH DETECTION
+        # =================================================================
+        for sus_path in self.threat_database.get('suspicious_paths', []):
+            if sus_path.lower() in exe_path:
                 risk_score += 2
+                threat_breakdown['categories'].append('Suspicious Location')
+                threat_breakdown['indicators'].append({
+                    'type': 'Suspicious Path',
+                    'severity': 'Medium',
+                    'description': f'Process running from suspicious location',
+                    'details': f'Path contains "{sus_path}"',
+                    'path': exe_path,
+                    'recommendation': 'Verify the process is legitimate. Malware often hides in temp folders.'
+                })
+        
+        # =================================================================
+        # 2. HIGH-RISK PROCESS NAMES
+        # =================================================================
+        for high_risk in self.threat_database.get('high_risk_processes', []):
+            if high_risk.lower() == process_name:
+                risk_score += 2
+                threat_breakdown['categories'].append('High-Risk Process')
+                threat_breakdown['indicators'].append({
+                    'type': 'High-Risk Process',
+                    'severity': 'Medium',
+                    'description': f'Process is commonly used by malware',
+                    'details': f'"{process_name}" is often exploited for malicious purposes',
+                    'recommendation': 'Check command-line arguments for suspicious activity.'
+                })
+                # Add command-line details for context
+                cmdline = process_details.get('cmdline', [])
+                if cmdline:
+                    threat_breakdown['details']['command_line'] = ' '.join(cmdline)
+        
+        # =================================================================
+        # 3. SUSPICIOUS NETWORK CONNECTIONS
+        # =================================================================
+        suspicious_ips = self.threat_database.get('suspicious_connections', [])
+        for conn in process_details.get('connections', []):
+            if conn.status == 'ESTABLISHED' and conn.raddr:
+                remote_ip = str(conn.raddr.ip)
+                remote_port = conn.raddr.port
                 
-        # Check high risk processes
-        if process_details['name'].lower() in self.threat_database['high_risk_processes']:
-            risk_score += 2
-            
-        # Check network connections
-        for conn in process_details['connections']:
-            if conn.status == 'ESTABLISHED':
-                if str(conn.raddr.ip) in self.threat_database['suspicious_connections']:
+                # Check against known suspicious IPs
+                if remote_ip in suspicious_ips:
                     risk_score += 3
-                    
-        # Check resource usage
-        if process_details['cpu_percent'] > 80:
+                    threat_breakdown['categories'].append('Suspicious Network')
+                    threat_breakdown['suspicious_connections'].append({
+                        'ip': remote_ip,
+                        'port': remote_port,
+                        'reason': 'Known suspicious IP',
+                        'severity': 'High'
+                    })
+                    threat_breakdown['indicators'].append({
+                        'type': 'Suspicious Connection',
+                        'severity': 'High',
+                        'description': f'Connection to known malicious IP',
+                        'details': f'Connected to {remote_ip}:{remote_port}',
+                        'recommendation': 'Block this IP and investigate the process.'
+                    })
+                
+                # Check for suspicious ports
+                suspicious_ports = {
+                    4444: 'Common backdoor/Metasploit',
+                    5555: 'Android Debug Bridge (potential exploit)',
+                    6666: 'IRC bot communication',
+                    6667: 'IRC bot communication',
+                    1337: 'Common hacker port',
+                    31337: 'Back Orifice trojan',
+                    12345: 'NetBus trojan',
+                    23: 'Telnet (insecure)',
+                    2323: 'Alternative telnet'
+                }
+                if remote_port in suspicious_ports:
+                    risk_score += 2
+                    if 'Suspicious Port' not in threat_breakdown['categories']:
+                        threat_breakdown['categories'].append('Suspicious Port')
+                    threat_breakdown['indicators'].append({
+                        'type': 'Suspicious Port',
+                        'severity': 'Medium',
+                        'description': suspicious_ports[remote_port],
+                        'details': f'Connection to port {remote_port}',
+                        'recommendation': 'Investigate why this port is being used.'
+                    })
+                
+                # VirusTotal IP check for external IPs
+                if not (remote_ip.startswith('192.168.') or 
+                        remote_ip.startswith('10.') or 
+                        remote_ip.startswith('172.') or
+                        remote_ip in ('127.0.0.1', '0.0.0.0')):
+                    mal, susp = vt_check_ip(remote_ip)
+                    if mal is not None or susp is not None:
+                        threat_breakdown['vt_ips'].append({
+                            'ip': remote_ip,
+                            'port': remote_port,
+                            'malicious': mal or 0,
+                            'suspicious': susp or 0
+                        })
+                        if (mal and mal > 0) or (susp and susp > 0):
+                            risk_score += min(3, (mal or 0) + (susp or 0))
+                            threat_breakdown['categories'].append('VT Flagged IP')
+                            threat_breakdown['indicators'].append({
+                                'type': 'VirusTotal Alert',
+                                'severity': 'High' if mal and mal >= 3 else 'Medium',
+                                'description': f'IP flagged by security vendors',
+                                'details': f'{remote_ip} - {mal} malicious, {susp} suspicious detections',
+                                'recommendation': 'Block this IP immediately.'
+                            })
+        
+        # =================================================================
+        # 4. RESOURCE ABUSE DETECTION (Cryptomining, DoS)
+        # =================================================================
+        cpu_percent = process_details.get('cpu_percent', 0)
+        memory_percent = process_details.get('memory_percent', 0)
+        
+        if cpu_percent > 80:
             risk_score += 1
-        if process_details['memory_percent'] > 80:
-            risk_score += 1
+            threat_breakdown['categories'].append('Resource Abuse')
+            threat_breakdown['resource_abuse'].append({
+                'type': 'High CPU',
+                'value': f'{cpu_percent:.1f}%',
+                'threshold': '80%'
+            })
+            threat_breakdown['indicators'].append({
+                'type': 'High CPU Usage',
+                'severity': 'Low',
+                'description': 'Process consuming excessive CPU',
+                'details': f'CPU usage: {cpu_percent:.1f}%',
+                'recommendation': 'May indicate cryptomining or runaway process.'
+            })
             
-        return risk_score
+        if memory_percent > 80:
+            risk_score += 1
+            if 'Resource Abuse' not in threat_breakdown['categories']:
+                threat_breakdown['categories'].append('Resource Abuse')
+            threat_breakdown['resource_abuse'].append({
+                'type': 'High Memory',
+                'value': f'{memory_percent:.1f}%',
+                'threshold': '80%'
+            })
+            threat_breakdown['indicators'].append({
+                'type': 'High Memory Usage',
+                'severity': 'Low',
+                'description': 'Process consuming excessive memory',
+                'details': f'Memory usage: {memory_percent:.1f}%',
+                'recommendation': 'May indicate memory leak or malicious activity.'
+            })
+        
+        # =================================================================
+        # 5. VIRUSTOTAL FILE HASH CHECK
+        # =================================================================
+        file_path = process_details.get('exe')
+        if file_path and Config.VIRUSTOTAL_API_KEY:
+            file_hash = vt_get_file_hash(file_path)
+            if file_hash:
+                mal, susp = vt_check_file(file_hash)
+                if mal is not None or susp is not None:
+                    threat_breakdown['vt_file'] = {
+                        'hash': file_hash,
+                        'malicious': mal or 0,
+                        'suspicious': susp or 0,
+                        'path': file_path
+                    }
+                    if (mal and mal > 0) or (susp and susp > 0):
+                        vt_risk = min(5, (mal or 0) + (susp or 0))
+                        risk_score += vt_risk
+                        threat_breakdown['categories'].append('VT Malware Detection')
+                        threat_breakdown['indicators'].append({
+                            'type': 'VirusTotal Malware',
+                            'severity': 'Critical' if mal and mal >= 5 else 'High',
+                            'description': f'File flagged as malware by security vendors',
+                            'details': f'{mal} malicious, {susp} suspicious detections',
+                            'hash': file_hash,
+                            'recommendation': 'TERMINATE IMMEDIATELY and quarantine the file.'
+                        })
+        
+        # =================================================================
+        # 6. DETERMINE OVERALL SEVERITY
+        # =================================================================
+        if risk_score == 0:
+            threat_breakdown['severity'] = 'Safe'
+        elif risk_score < 3:
+            threat_breakdown['severity'] = 'Low'
+        elif risk_score < 5:
+            threat_breakdown['severity'] = 'Medium'
+        elif risk_score < 8:
+            threat_breakdown['severity'] = 'High'
+        else:
+            threat_breakdown['severity'] = 'Critical'
+        
+        # =================================================================
+        # 7. GENERATE RECOMMENDATIONS
+        # =================================================================
+        unique_categories = list(set(threat_breakdown['categories']))
+        threat_breakdown['categories'] = unique_categories
+        
+        if 'VT Malware Detection' in unique_categories:
+            threat_breakdown['recommendations'].append('🚨 CRITICAL: Terminate process and quarantine file immediately')
+        if 'VT Flagged IP' in unique_categories or 'Suspicious Network' in unique_categories:
+            threat_breakdown['recommendations'].append('🔒 Block suspicious IP addresses using firewall')
+        if 'High-Risk Process' in unique_categories:
+            threat_breakdown['recommendations'].append('🔍 Review command-line arguments for suspicious activity')
+        if 'Suspicious Location' in unique_categories:
+            threat_breakdown['recommendations'].append('📁 Verify file origin and scan with antivirus')
+        if 'Resource Abuse' in unique_categories:
+            threat_breakdown['recommendations'].append('⚡ Monitor resource usage; may indicate cryptomining')
+        
+        # Store process details
+        threat_breakdown['details']['process_name'] = process_details.get('name', 'Unknown')
+        threat_breakdown['details']['pid'] = process_details.get('pid')
+        threat_breakdown['details']['exe'] = process_details.get('exe', 'Unknown')
+        threat_breakdown['details']['username'] = process_details.get('username', 'Unknown')
+        threat_breakdown['details']['create_time'] = process_details.get('create_time', 'Unknown')
+        
+        return risk_score, threat_breakdown
 
-    def terminate_process(self, pid):
+    def terminate_process(self, pid: int) -> bool:
+        """Terminate a process by PID."""
         try:
             process = psutil.Process(pid)
+            process_name = process.name()
             process.terminate()
-            logging.info(f"Terminated suspicious process: {process.name()} (PID: {pid})")
-            print(f"{Fore.RED}[!] Terminated suspicious process: {process.name()} (PID: {pid}){Style.RESET_ALL}")
+            app_logger.warning(f"Terminated suspicious process: {process_name} (PID: {pid})")
+            print(f"{Fore.RED}[!] Terminated suspicious process: {process_name} (PID: {pid}){Style.RESET_ALL}")
             return True
-        except:
-            logging.error(f"Failed to terminate process with PID: {pid}")
+        except psutil.NoSuchProcess:
+            app_logger.warning(f"Process {pid} no longer exists")
+            return False
+        except psutil.AccessDenied:
+            app_logger.error(f"Access denied when terminating PID {pid}")
+            return False
+        except Exception as e:
+            app_logger.error(f"Failed to terminate process {pid}: {e}")
             return False
 
 
     def monitor_system(self):
+        """Main monitoring loop - continuously scans running processes for threats."""
         if not self.gui_callback:
             print(f"{Fore.GREEN}[+] Starting Security Threat Intelligence Monitor...{Style.RESET_ALL}")
             print(f"{Fore.CYAN}[*] Press Ctrl+C to stop monitoring{Style.RESET_ALL}")
         
+        app_logger.info("Starting system monitoring")
+        
         while self.running:
             try:
-                # Get all running processes
                 for process in psutil.process_iter(['pid', 'name']):
                     pid = process.info['pid']
-                    # Skip if we've already analyzed this process recently
-                    if pid in self.known_processes and \
-                       time.time() - self.known_processes[pid]['last_check'] < 60:
-                        continue
-                    # Get detailed process information
+                    
+                    # Skip recently checked processes
+                    cache_entry = self.known_processes.get(pid)
+                    if cache_entry:
+                        time_since_check = time.time() - cache_entry['last_check']
+                        if time_since_check < Config.PROCESS_CACHE_TTL_SECONDS:
+                            continue
+                    
+                    # Get process details
                     process_details = self.get_process_details(pid)
                     if not process_details:
                         continue
-                    # Analyze the process for potential threats
-                    risk_score = self.analyze_process(process_details)
-                    # Update known processes
+                    
+                    # Analyze for threats with detailed breakdown
+                    risk_score, threat_breakdown = self.analyze_process(process_details)
+                    
+                    # Update cache
                     self.known_processes[pid] = {
                         'last_check': time.time(),
-                        'risk_score': risk_score
+                        'risk_score': risk_score,
+                        'breakdown': threat_breakdown
                     }
-                    # Handle high-risk and suspicious processes
-                    if risk_score >= 3:
+                    
+                    # Handle threats
+                    if risk_score >= Config.RISK_THRESHOLD_WARNING:
+                        is_critical = risk_score >= Config.RISK_THRESHOLD_CRITICAL
+                        status = 'High-Risk' if is_critical else 'Suspicious'
+                        
+                        # Build threat info with breakdown
                         threat_info = {
                             'pid': pid,
                             'name': process_details['name'],
                             'exe': process_details['exe'],
                             'risk_score': risk_score,
-                            'status': 'High-Risk' if risk_score >= 5 else 'Suspicious'
+                            'status': status,
+                            'severity': threat_breakdown.get('severity', 'Unknown'),
+                            'categories': threat_breakdown.get('categories', []),
+                            'indicators': threat_breakdown.get('indicators', []),
+                            'recommendations': threat_breakdown.get('recommendations', []),
+                            'vt_file': threat_breakdown.get('vt_file'),
+                            'vt_ips': threat_breakdown.get('vt_ips', []),
+                            'suspicious_connections': threat_breakdown.get('suspicious_connections', []),
+                            'resource_abuse': threat_breakdown.get('resource_abuse', []),
+                            'details': threat_breakdown.get('details', {})
                         }
+                        
                         if self.gui_callback:
                             self.gui_callback(threat_info)
                         else:
-                            msg = f"High-risk process detected!\n" \
-                                  f"Process: {process_details['name']}\n" \
-                                  f"PID: {pid}\n" \
-                                  f"Path: {process_details['exe']}\n" \
-                                  f"Risk Score: {risk_score}"
-                            print(f"{Fore.RED}[!] {msg}{Style.RESET_ALL}")
-                            logging.warning(msg)
-                            if risk_score >= 5:
-                                if input(f"{Fore.YELLOW}Do you want to terminate this process? (y/n): {Style.RESET_ALL}").lower() == 'y':
+                            # Console output with breakdown
+                            severity_colors = {
+                                'Critical': Fore.RED,
+                                'High': Fore.LIGHTRED_EX,
+                                'Medium': Fore.YELLOW,
+                                'Low': Fore.LIGHTYELLOW_EX,
+                                'Safe': Fore.GREEN
+                            }
+                            sev_color = severity_colors.get(threat_breakdown['severity'], Fore.WHITE)
+                            
+                            print(f"\n{Fore.RED}{'='*60}{Style.RESET_ALL}")
+                            print(f"{sev_color}[!] {threat_breakdown['severity'].upper()} THREAT DETECTED{Style.RESET_ALL}")
+                            print(f"{Fore.RED}{'='*60}{Style.RESET_ALL}")
+                            print(f"  Process: {process_details['name']} (PID: {pid})")
+                            print(f"  Path: {process_details['exe']}")
+                            print(f"  Risk Score: {risk_score}")
+                            print(f"  Severity: {sev_color}{threat_breakdown['severity']}{Style.RESET_ALL}")
+                            
+                            if threat_breakdown['categories']:
+                                print(f"\n  {Fore.CYAN}Categories:{Style.RESET_ALL}")
+                                for cat in threat_breakdown['categories']:
+                                    print(f"    • {cat}")
+                            
+                            if threat_breakdown['indicators']:
+                                print(f"\n  {Fore.CYAN}Threat Indicators:{Style.RESET_ALL}")
+                                for ind in threat_breakdown['indicators']:
+                                    ind_color = Fore.RED if ind['severity'] in ('Critical', 'High') else Fore.YELLOW
+                                    print(f"    [{ind_color}{ind['severity']}{Style.RESET_ALL}] {ind['type']}")
+                                    print(f"        {ind['description']}")
+                                    print(f"        → {ind['details']}")
+                            
+                            if threat_breakdown['recommendations']:
+                                print(f"\n  {Fore.GREEN}Recommendations:{Style.RESET_ALL}")
+                                for rec in threat_breakdown['recommendations']:
+                                    print(f"    {rec}")
+                            
+                            print(f"{Fore.RED}{'='*60}{Style.RESET_ALL}\n")
+                            app_logger.warning(
+                                f"Threat detected: {process_details['name']} (PID: {pid}) | "
+                                f"Score: {risk_score} | Severity: {threat_breakdown['severity']} | "
+                                f"Categories: {', '.join(threat_breakdown['categories'])}"
+                            )
+                            
+                            if is_critical:
+                                response = input(
+                                    f"{Fore.YELLOW}Do you want to terminate this process? (y/n): {Style.RESET_ALL}"
+                                )
+                                if response.lower() == 'y':
                                     self.terminate_process(pid)
-                    # Sleep for a short duration to prevent high CPU usage
-                time.sleep(1)
+                
+                time.sleep(Config.SCAN_INTERVAL_SECONDS)
+                
             except KeyboardInterrupt:
                 self.running = False
                 if not self.gui_callback:
                     print(f"{Fore.GREEN}[+] Stopping Security Threat Intelligence Monitor...{Style.RESET_ALL}")
+                app_logger.info("Monitoring stopped by user")
                 break
             except Exception as e:
-                logging.error(f"Error in monitoring: {str(e)}")
+                app_logger.error(f"Error in monitoring loop: {e}")
                 if not self.gui_callback:
-                    print(f"{Fore.RED}[!] Error: {str(e)}{Style.RESET_ALL}")
+                    print(f"{Fore.RED}[!] Error: {e}{Style.RESET_ALL}")
                 continue
 
 
-import ctypes
+# =============================================================================
+# GUI APPLICATION
+# =============================================================================
 
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-def get_router_and_devices():
-    if not (NETIFACES_AVAILABLE and SCAPY_AVAILABLE):
-        return None, []
-    gateways = netifaces.gateways()
-    router_ip = gateways.get('default', {}).get(netifaces.AF_INET, [None])[0]
-    devices = []
-    if router_ip:
-        ip_range = router_ip.rsplit('.', 1)[0] + '.1/24'
-        try:
-            # Use scapy to ARP scan the subnet for all devices
-            ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip_range), timeout=2, verbose=0)
-            for snd, rcv in ans:
-                ip = rcv.psrc
-                mac = rcv.hwsrc
-                # Try to resolve hostname
-                try:
-                    import socket
-                    name = socket.gethostbyaddr(ip)[0]
-                except Exception:
-                    name = ip
-                devices.append({
-                    'ip': ip,
-                    'mac': mac,
-                    'name': name
-                })
-        except Exception:
-            pass
-    return router_ip, devices
-
-# --- Advanced analytics helpers for network map ---
-device_last_seen = {}
-def lookup_vendor(mac):
-    try:
-        import requests
-        resp = requests.get(f'https://api.macvendors.com/{mac}', timeout=2)
-        if resp.status_code == 200:
-            return resp.text
-    except Exception:
-        pass
-    return "Unknown"
-def guess_type(name, vendor):
-    name = name.lower()
-    vendor = vendor.lower()
-    if "router" in name or "gateway" in name:
-        return "Router"
-    if any(x in vendor for x in ["intel", "realtek", "broadcom", "atheros"]):
-        return "PC/NIC"
-    if any(x in vendor for x in ["apple", "samsung", "android", "huawei", "xiaomi"]):
-        return "Mobile"
-    if any(x in vendor for x in ["printer", "hp inc", "canon", "epson"]):
-        return "Printer"
-    if any(x in vendor for x in ["camera", "hikvision", "dahua"]):
-        return "Camera"
-    return "Unknown"
-
-# --- GUI Entrypoint ---
 def run_gui():
+    """Main GUI application entry point."""
     root = tk.Tk()
     root.title("Security Threat Intelligence Monitor")
     root.geometry("950x550")
@@ -310,6 +841,12 @@ def run_gui():
     style.theme_use('clam')
     style.configure('Treeview', rowheight=28, font=('Segoe UI', 10))
     style.configure('Treeview.Heading', font=('Segoe UI', 11, 'bold'))
+    
+    # Custom styles for severity levels
+    style.configure('Critical.TLabel', foreground='#dc3545', font=('Segoe UI', 10, 'bold'))
+    style.configure('High.TLabel', foreground='#fd7e14', font=('Segoe UI', 10, 'bold'))
+    style.configure('Medium.TLabel', foreground='#ffc107', font=('Segoe UI', 10))
+    style.configure('Low.TLabel', foreground='#28a745', font=('Segoe UI', 10))
 
     # Tabs
     notebook = ttk.Notebook(root)
@@ -317,30 +854,40 @@ def run_gui():
 
     # --- Process Threats Tab ---
     process_frame = ttk.Frame(notebook)
-    notebook.add(process_frame, text='Process Threats')
-    status_var = tk.StringVar(value="Status: Monitoring (Running in Background)")
+    notebook.add(process_frame, text='🛡️ Threat Analysis')
+    status_var = tk.StringVar(value="Status: Monitoring (Running in Background) | Double-click threat for details")
     status_label = ttk.Label(process_frame, textvariable=status_var, anchor="w")
     status_label.pack(fill=tk.X, padx=5, pady=2)
 
-    columns = ("PID", "Name", "Path", "Risk Score", "Status", "VT File", "VT IP", "Suspicious Network", "Action")
+    columns = ("PID", "Name", "Severity", "Risk", "Categories", "VT Status", "Actions")
     tree = ttk.Treeview(process_frame, columns=columns, show="headings", height=15)
     for col in columns:
         tree.heading(col, text=col)
-        if col == "Path":
-            tree.column(col, width=220)
-        elif col == "Suspicious Network":
-            tree.column(col, width=180)
-        elif col == "VT File" or col == "VT IP":
-            tree.column(col, width=90)
-        elif col == "Action":
+        if col == "Name":
             tree.column(col, width=140)
+        elif col == "Categories":
+            tree.column(col, width=250)
+        elif col == "VT Status":
+            tree.column(col, width=120)
+        elif col == "Actions":
+            tree.column(col, width=120)
+        elif col == "Severity":
+            tree.column(col, width=80)
+        elif col == "Risk":
+            tree.column(col, width=50)
         else:
-            tree.column(col, width=90)
+            tree.column(col, width=70)
     tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+    # Configure row colors for severity
+    tree.tag_configure('critical', background='#f8d7da', foreground='#721c24')
+    tree.tag_configure('high', background='#fff3cd', foreground='#856404')
+    tree.tag_configure('medium', background='#ffeeba', foreground='#856404')
+    tree.tag_configure('low', background='#d4edda', foreground='#155724')
 
     # --- Network Tab ---
     network_frame = ttk.Frame(notebook)
-    notebook.add(network_frame, text='Network Activity')
+    notebook.add(network_frame, text='🌐 Network Activity')
     net_columns = ("PID", "Process", "Local Address", "Remote Address", "Status", "Suspicious", "VT IP")
     net_tree = ttk.Treeview(network_frame, columns=net_columns, show="headings", height=15)
     for col in net_columns:
@@ -355,7 +902,7 @@ def run_gui():
 
     # --- Network Packet Tab ---
     packet_frame = ttk.Frame(notebook)
-    notebook.add(packet_frame, text='Network Packets')
+    notebook.add(packet_frame, text='📦 Network Packets')
     pkt_columns = ("Time", "Source", "Destination", "Protocol", "Info", "Threat")
     pkt_tree = ttk.Treeview(packet_frame, columns=pkt_columns, show="headings", height=15)
     for col in pkt_columns:
@@ -397,8 +944,8 @@ def run_gui():
 
     # --- Network Map Tab ---
     map_frame = ttk.Frame(notebook)
-    notebook.add(map_frame, text='Network Map')
-    map_label = ttk.Label(map_frame, text="(Admin required) Displays router and connected devices.", font=("Segoe UI", 10))
+    notebook.add(map_frame, text='🗺️ Network Map')
+    map_label = ttk.Label(map_frame, text="Discover router and connected devices on your network.", font=("Segoe UI", 10))
     map_label.pack(pady=5)
     analytics_var = tk.StringVar(value="")
     analytics_label = ttk.Label(map_frame, textvariable=analytics_var, font=("Segoe UI", 10, "italic"), foreground="#444")
@@ -410,20 +957,10 @@ def run_gui():
         map_tree.column(col, width=140 if col!="Name" else 180)
     map_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
     # Always enable the button, check for modules at click time
-    map_btn = ttk.Button(map_frame, text="Scan Network", state=tk.NORMAL)
+    map_btn = ttk.Button(map_frame, text="🔍 Scan Network", state=tk.NORMAL)
     map_btn.pack(pady=5)
-    def check_network_libs():
-        missing = []
-        try:
-            import scapy.all
-        except ImportError:
-            missing.append('scapy')
-        try:
-            import netifaces
-        except ImportError:
-            missing.append('netifaces')
-        return missing
-    if check_network_libs():
+    
+    if check_network_dependencies():
         map_tree.insert("", 0, values=("-", "-", "-", "-", "-", "Install netifaces & scapy for network map"))
 
     # --- Controls ---
@@ -437,92 +974,254 @@ def run_gui():
         else:
             status_var.set("Status: Monitoring (Running in Background)")
 
-    pause_btn = ttk.Button(control_frame, text="Pause/Resume", command=toggle_pause)
+    pause_btn = ttk.Button(control_frame, text="⏸️ Pause/Resume", command=toggle_pause)
     pause_btn.pack(side=tk.LEFT, padx=2)
-    export_btn = ttk.Button(control_frame, text="Export Threats", command=lambda: export_threats(tree))
+    export_btn = ttk.Button(control_frame, text="📁 Export Threats", command=lambda: export_threats(tree))
     export_btn.pack(side=tk.LEFT, padx=2)
-    refresh_btn = ttk.Button(control_frame, text="Refresh Network", command=lambda: update_network_tab())
+    refresh_btn = ttk.Button(control_frame, text="🔄 Refresh Network", command=lambda: update_network_tab())
     refresh_btn.pack(side=tk.LEFT, padx=2)
 
-    # Store threats by PID
+    # Store threats by PID with full breakdown
     threats = {}
 
     def gui_callback(threat_info):
+        """Enhanced callback that stores full threat breakdown for detail view."""
         if pause_var.get():
             return
         pid = threat_info['pid']
-        if pid not in threats or threats[pid]['risk_score'] != threat_info['risk_score']:
-            threats[pid] = threat_info
-            # Insert or update row
-            for item in tree.get_children():
-                if tree.item(item)['values'][0] == pid:
-                    tree.delete(item)
-            vt_file = vt_ip = "-"
-            # Show VT results if available
-            vt_file_mal = threat_info.get('vt_file_malicious')
-            vt_file_susp = threat_info.get('vt_file_suspicious')
-            if vt_file_mal is not None or vt_file_susp is not None:
-                vt_file = f"M:{vt_file_mal or 0}/S:{vt_file_susp or 0}"
-            vt_ip_mal = threat_info.get('vt_ip_malicious')
-            vt_ip_susp = threat_info.get('vt_ip_suspicious')
-            if vt_ip_mal is not None or vt_ip_susp is not None:
-                vt_ip = f"M:{vt_ip_mal or 0}/S:{vt_ip_susp or 0}"
-
-            # Gather suspicious network info for this process
-            suspicious_networks = []
-            try:
-                proc = psutil.Process(pid)
-                for conn in proc.net_connections():
-                    if conn.status == 'ESTABLISHED' and conn.raddr:
-                        remote_ip = str(conn.raddr.ip)
-                        remote_port = str(conn.raddr.port)
-                        if remote_ip in monitor.threat_database.get('suspicious_connections', []):
-                            suspicious_networks.append(f"{remote_ip}:{remote_port}")
-            except Exception:
-                pass
-            sus_net_summary = ", ".join(suspicious_networks) if suspicious_networks else "-"
-            # Show both actions if both are relevant
-            actions = []
-            if threat_info['risk_score'] >= 5:
-                actions.append("Terminate")
-            if suspicious_networks:
-                actions.append("Network Actions")
-            action_text = ", ".join(actions) if actions else "-"
-            tree.insert("", "end", values=(pid, threat_info['name'], threat_info['exe'], threat_info['risk_score'], threat_info['status'], vt_file, vt_ip, sus_net_summary, action_text))
+        
+        # Store full threat info including breakdown
+        threats[pid] = threat_info
+        
+        # Remove existing row if present
+        for item in tree.get_children():
+            if tree.item(item)['values'][0] == pid:
+                tree.delete(item)
+        
+        # Format severity with emoji
+        severity = threat_info.get('severity', 'Unknown')
+        severity_icons = {
+            'Critical': '🔴 Critical',
+            'High': '🟠 High',
+            'Medium': '🟡 Medium',
+            'Low': '🟢 Low',
+            'Safe': '✅ Safe'
+        }
+        severity_display = severity_icons.get(severity, severity)
+        
+        # Format categories as readable list
+        categories = threat_info.get('categories', [])
+        categories_display = ', '.join(categories[:3]) if categories else 'None'
+        if len(categories) > 3:
+            categories_display += f' (+{len(categories)-3})'
+        
+        # Format VT status
+        vt_file = threat_info.get('vt_file')
+        vt_ips = threat_info.get('vt_ips', [])
+        vt_status_parts = []
+        if vt_file:
+            mal = vt_file.get('malicious', 0)
+            susp = vt_file.get('suspicious', 0)
+            if mal > 0 or susp > 0:
+                vt_status_parts.append(f"File: {mal}M/{susp}S")
+        if vt_ips:
+            total_mal = sum(ip.get('malicious', 0) for ip in vt_ips)
+            total_susp = sum(ip.get('suspicious', 0) for ip in vt_ips)
+            if total_mal > 0 or total_susp > 0:
+                vt_status_parts.append(f"IPs: {total_mal}M/{total_susp}S")
+        vt_status = ' | '.join(vt_status_parts) if vt_status_parts else '✓ Clean'
+        
+        # Format actions
+        actions = ['📋 Details']
+        if threat_info['risk_score'] >= 5:
+            actions.append('⛔ Terminate')
+        if threat_info.get('suspicious_connections'):
+            actions.append('🔒 Block')
+        action_display = ' '.join(actions)
+        
+        # Determine row tag for coloring
+        severity_tag = severity.lower() if severity in ('Critical', 'High', 'Medium', 'Low') else ''
+        
+        # Insert row
+        tree.insert("", "end", 
+            values=(pid, threat_info['name'], severity_display, threat_info['risk_score'], 
+                    categories_display, vt_status, action_display),
+            tags=(severity_tag,) if severity_tag else ())
 
     # Initialize monitor before any callback uses it
     monitor = ThreatMonitor(gui_callback=gui_callback)
     monitor_thread = threading.Thread(target=monitor.monitor_system, daemon=True)
     monitor_thread.start()
 
+    def show_threat_details_popup(pid):
+        """Show detailed threat analysis breakdown in a readable popup."""
+        if pid not in threats:
+            messagebox.showinfo("No Data", "No threat data available for this process.")
+            return
+        
+        threat = threats[pid]
+        
+        popup = tk.Toplevel(root)
+        popup.title(f"🛡️ Threat Analysis: {threat['name']} (PID: {pid})")
+        popup.geometry("700x600")
+        popup.configure(bg='#f8f9fa')
+        
+        # Create scrollable frame
+        canvas = tk.Canvas(popup, bg='#f8f9fa')
+        scrollbar = ttk.Scrollbar(popup, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Header
+        header_frame = ttk.Frame(scrollable_frame)
+        header_frame.pack(fill=tk.X, padx=15, pady=10)
+        
+        severity = threat.get('severity', 'Unknown')
+        severity_colors = {'Critical': '#dc3545', 'High': '#fd7e14', 'Medium': '#ffc107', 'Low': '#28a745', 'Safe': '#17a2b8'}
+        sev_color = severity_colors.get(severity, '#6c757d')
+        
+        ttk.Label(header_frame, text=f"Process: {threat['name']}", font=('Segoe UI', 14, 'bold')).pack(anchor='w')
+        ttk.Label(header_frame, text=f"PID: {pid} | Path: {threat['exe']}", font=('Segoe UI', 9)).pack(anchor='w')
+        
+        # Severity banner
+        severity_frame = tk.Frame(scrollable_frame, bg=sev_color)
+        severity_frame.pack(fill=tk.X, padx=15, pady=5)
+        tk.Label(severity_frame, text=f"SEVERITY: {severity.upper()} | Risk Score: {threat['risk_score']}", 
+                 font=('Segoe UI', 12, 'bold'), bg=sev_color, fg='white').pack(pady=8)
+        
+        # Categories section
+        if threat.get('categories'):
+            cat_frame = ttk.LabelFrame(scrollable_frame, text="🏷️ Threat Categories")
+            cat_frame.pack(fill=tk.X, padx=15, pady=5)
+            cats_text = "  •  ".join(threat['categories'])
+            ttk.Label(cat_frame, text=cats_text, wraplength=650, font=('Segoe UI', 10)).pack(padx=10, pady=5)
+        
+        # Indicators section
+        if threat.get('indicators'):
+            ind_frame = ttk.LabelFrame(scrollable_frame, text="🔍 Threat Indicators (Detailed Breakdown)")
+            ind_frame.pack(fill=tk.X, padx=15, pady=5)
+            
+            for i, ind in enumerate(threat['indicators']):
+                ind_row = ttk.Frame(ind_frame)
+                ind_row.pack(fill=tk.X, padx=10, pady=5)
+                
+                # Severity badge
+                ind_sev = ind.get('severity', 'Unknown')
+                ind_color = severity_colors.get(ind_sev, '#6c757d')
+                
+                # Type and severity
+                type_label = tk.Label(ind_row, text=f"[{ind_sev}]", font=('Segoe UI', 9, 'bold'), 
+                                     fg='white', bg=ind_color, padx=5)
+                type_label.pack(side=tk.LEFT)
+                ttk.Label(ind_row, text=f" {ind.get('type', 'Unknown')}", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT)
+                
+                # Description
+                desc_frame = ttk.Frame(ind_frame)
+                desc_frame.pack(fill=tk.X, padx=25, pady=2)
+                ttk.Label(desc_frame, text=f"📝 {ind.get('description', '')}", wraplength=600).pack(anchor='w')
+                ttk.Label(desc_frame, text=f"   → {ind.get('details', '')}", wraplength=600, 
+                         font=('Consolas', 9)).pack(anchor='w')
+                if ind.get('recommendation'):
+                    ttk.Label(desc_frame, text=f"   💡 {ind.get('recommendation', '')}", 
+                             wraplength=600, font=('Segoe UI', 9, 'italic')).pack(anchor='w')
+                
+                # Separator
+                if i < len(threat['indicators']) - 1:
+                    ttk.Separator(ind_frame, orient='horizontal').pack(fill=tk.X, padx=10, pady=5)
+        
+        # VirusTotal Results
+        vt_file = threat.get('vt_file')
+        vt_ips = threat.get('vt_ips', [])
+        if vt_file or vt_ips:
+            vt_frame = ttk.LabelFrame(scrollable_frame, text="🦠 VirusTotal Analysis")
+            vt_frame.pack(fill=tk.X, padx=15, pady=5)
+            
+            if vt_file:
+                mal = vt_file.get('malicious', 0)
+                susp = vt_file.get('suspicious', 0)
+                file_status = "⚠️ FLAGGED" if (mal > 0 or susp > 0) else "✅ Clean"
+                ttk.Label(vt_frame, text=f"File Hash: {vt_file.get('hash', 'N/A')[:16]}...", 
+                         font=('Consolas', 9)).pack(anchor='w', padx=10)
+                ttk.Label(vt_frame, text=f"   {file_status} - {mal} malicious, {susp} suspicious detections",
+                         font=('Segoe UI', 10)).pack(anchor='w', padx=10, pady=2)
+            
+            if vt_ips:
+                ttk.Label(vt_frame, text="IP Address Analysis:", font=('Segoe UI', 10, 'bold')).pack(anchor='w', padx=10, pady=5)
+                for ip_info in vt_ips:
+                    mal = ip_info.get('malicious', 0)
+                    susp = ip_info.get('suspicious', 0)
+                    ip_status = "⚠️ FLAGGED" if (mal > 0 or susp > 0) else "✅ Clean"
+                    ttk.Label(vt_frame, text=f"   {ip_info['ip']}:{ip_info.get('port', '?')} - {ip_status} ({mal}M/{susp}S)",
+                             font=('Consolas', 9)).pack(anchor='w', padx=10)
+        
+        # Suspicious Connections
+        sus_conns = threat.get('suspicious_connections', [])
+        if sus_conns:
+            conn_frame = ttk.LabelFrame(scrollable_frame, text="🌐 Suspicious Network Connections")
+            conn_frame.pack(fill=tk.X, padx=15, pady=5)
+            for conn in sus_conns:
+                ttk.Label(conn_frame, text=f"   ⚠️ {conn['ip']}:{conn['port']} - {conn.get('reason', 'Unknown')}",
+                         font=('Consolas', 9)).pack(anchor='w', padx=10, pady=2)
+        
+        # Resource Abuse
+        resource_abuse = threat.get('resource_abuse', [])
+        if resource_abuse:
+            res_frame = ttk.LabelFrame(scrollable_frame, text="⚡ Resource Usage")
+            res_frame.pack(fill=tk.X, padx=15, pady=5)
+            for res in resource_abuse:
+                ttk.Label(res_frame, text=f"   {res['type']}: {res['value']} (threshold: {res['threshold']})",
+                         font=('Segoe UI', 10)).pack(anchor='w', padx=10, pady=2)
+        
+        # Recommendations
+        if threat.get('recommendations'):
+            rec_frame = ttk.LabelFrame(scrollable_frame, text="💡 Recommendations")
+            rec_frame.pack(fill=tk.X, padx=15, pady=5)
+            for rec in threat['recommendations']:
+                ttk.Label(rec_frame, text=f"   {rec}", wraplength=650, font=('Segoe UI', 10)).pack(anchor='w', padx=10, pady=2)
+        
+        # Action buttons
+        btn_frame = ttk.Frame(scrollable_frame)
+        btn_frame.pack(fill=tk.X, padx=15, pady=15)
+        
+        def terminate_process():
+            if messagebox.askyesno("Confirm", f"Terminate {threat['name']} (PID: {pid})?"):
+                monitor.terminate_process(pid)
+                popup.destroy()
+        
+        def block_ips():
+            if sus_conns:
+                show_network_actions_popup(pid, threat['name'], ', '.join(f"{c['ip']}:{c['port']}" for c in sus_conns))
+        
+        if threat['risk_score'] >= 5:
+            ttk.Button(btn_frame, text="⛔ Terminate Process", command=terminate_process).pack(side=tk.LEFT, padx=5)
+        if sus_conns:
+            ttk.Button(btn_frame, text="🔒 Block IPs", command=block_ips).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=popup.destroy).pack(side=tk.RIGHT, padx=5)
+        
+        # Pack scrollbar
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
     def on_tree_click(event):
+        """Handle click on threat row - show details popup."""
         item = tree.identify_row(event.y)
         if not item:
             return
         values = tree.item(item)['values']
-        pid, name, exe, risk_score, status, vt_file, vt_ip, sus_net, action = values
-        actions = [a.strip() for a in action.split(",")]
-        # Show context menu on right-click, or handle double-click as before
-        def show_context_menu(event):
-            menu = tk.Menu(root, tearoff=0)
-            if "Terminate" in actions:
-                menu.add_command(label="Terminate Process", command=lambda: terminate_selected())
-            if "Network Actions" in actions and sus_net != "-":
-                menu.add_command(label="Network Actions", command=lambda: show_network_actions_popup(pid, name, sus_net))
-            menu.post(event.x_root, event.y_root)
+        pid = values[0]
+        
+        # Show detailed threat analysis popup
+        show_threat_details_popup(pid)
 
-        def terminate_selected():
-            if messagebox.askyesno("Terminate Process", f"Terminate {name} (PID: {pid})?"):
-                monitor.terminate_process(pid)
-                tree.delete(item)
-                del threats[pid]
-
-        # On double-click, show context menu for user to pick action
-        show_context_menu(event)
-
-    # Bind right-click and double-click to show context menu
-    tree.bind("<Button-3>", on_tree_click)  # Right-click
-    tree.bind("<Double-1>", on_tree_click)  # Double-click
+    # Bind double-click to show detailed analysis
+    tree.bind("<Double-1>", on_tree_click)
 
     def show_network_actions_popup(pid, name, sus_net):
         popup = tk.Toplevel(root)
@@ -723,14 +1422,14 @@ def run_gui():
     def scan_network():
         map_tree.delete(*map_tree.get_children())
         analytics_var.set("")
-        missing = check_network_libs()
+        missing = check_network_dependencies()
         if missing:
             map_tree.insert("", 0, values=('-', '-', '-', '-', '-', f"Install {' & '.join(missing)} for network map"))
             return
         router_ip, devices = get_router_and_devices()
         device_count = 0
         type_counts = {}
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if router_ip:
             map_tree.insert("", "end", values=(router_ip, '', 'Router', 'N/A', 'Router', now))
             device_last_seen[router_ip] = now
@@ -741,7 +1440,7 @@ def run_gui():
                 mac = dev['mac']
                 name = dev['name']
                 vendor = lookup_vendor(mac)
-                dtype = guess_type(name, vendor)
+                dtype = guess_device_type(name, vendor)
                 last_seen = now
                 device_last_seen[dev['ip']] = last_seen
                 map_tree.insert("", "end", values=(dev['ip'], mac, name, vendor, dtype, last_seen))
@@ -763,5 +1462,36 @@ def run_gui():
     update_network_tab()
     root.mainloop()
 
-if __name__ == "__main__":
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main():
+    """Main entry point for the application."""
+    # Display startup information
+    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}Security Threat Intelligence Monitor v2.0{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+    
+    # Check admin rights
+    if not is_admin():
+        print(f"{Fore.YELLOW}[!] Running without administrator privileges.")
+        print(f"    Some features may be limited (packet capture, firewall rules).{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.GREEN}[+] Running with administrator privileges.{Style.RESET_ALL}")
+    
+    # Check VirusTotal configuration
+    if not Config.VIRUSTOTAL_API_KEY:
+        print(f"{Fore.YELLOW}[!] VirusTotal API key not configured. File/IP scanning disabled.{Style.RESET_ALL}")
+        print(f"    Copy .env.example to .env and add your API key.{Style.RESET_ALL}")
+    
+    # Log startup
+    app_logger.info("Application starting")
+    
+    # Launch GUI
     run_gui()
+
+
+if __name__ == "__main__":
+    main()

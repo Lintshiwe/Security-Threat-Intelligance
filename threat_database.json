@@ -4,7 +4,11 @@
         "\\downloads\\",
         "\\appdata\\local\\temp\\",
         "\\programdata\\",
-        "\\windows\\temp\\"
+        "\\windows\\temp\\",
+        "\\users\\public\\",
+        "\\appdata\\roaming\\",
+        "\\recycler\\",
+        "\\$recycle.bin\\"
     ],
     "suspicious_connections": [
         "0.0.0.0",
@@ -18,6 +22,37 @@
         "regsvr32.exe",
         "mshta.exe",
         "rundll32.exe",
-        "svchost.exe"
-    ]
+        "certutil.exe",
+        "bitsadmin.exe",
+        "msiexec.exe",
+        "wmic.exe",
+        "installutil.exe",
+        "regasm.exe",
+        "regsvcs.exe",
+        "msbuild.exe"
+    ],
+    "suspicious_ports": {
+        "23": "Telnet (insecure protocol)",
+        "2323": "Alternative Telnet",
+        "4444": "Metasploit default handler",
+        "5555": "Android ADB exploit",
+        "6666": "IRC bot C2",
+        "6667": "IRC bot C2",
+        "1337": "Common backdoor port",
+        "31337": "Back Orifice trojan",
+        "12345": "NetBus trojan",
+        "3389": "RDP (if unexpected)",
+        "5900": "VNC (if unexpected)",
+        "8080": "HTTP proxy (verify legitimacy)"
+    },
+    "threat_descriptions": {
+        "Suspicious Path": "Process is running from a location commonly used by malware to hide.",
+        "High-Risk Process": "This process type is frequently abused for malicious purposes like command execution, script running, or living-off-the-land attacks.",
+        "Suspicious Connection": "Network connection to a known malicious or suspicious IP address.",
+        "Suspicious Port": "Communication over a port commonly associated with malware, backdoors, or insecure protocols.",
+        "High CPU Usage": "Abnormally high CPU consumption may indicate cryptomining or resource abuse.",
+        "High Memory Usage": "Excessive memory usage may indicate memory-resident malware or resource abuse.",
+        "VT Malware Detection": "VirusTotal has flagged this file as malicious by multiple security vendors.",
+        "VT Flagged IP": "VirusTotal has flagged this IP address as associated with malicious activity."
+    }
 }
